@@ -1,7 +1,4 @@
-use core::{
-    fmt::{Debug, Display},
-    future::Future,
-};
+use core::fmt::{Debug, Display};
 
 type IntoIter<T> = <T as IntoIterator>::IntoIter;
 type CStrBytes<'a> = core::iter::Chain<core::str::Bytes<'a>, core::iter::Once<u8>>;
@@ -10,115 +7,33 @@ pub const BLOCK_SIZE: usize = 512;
 pub const HEADER_SIZE: usize = 4;
 pub const PACKET_SIZE: usize = BLOCK_SIZE + HEADER_SIZE;
 
-pub struct Download<'a, S, A> {
-    socket: &'a mut S,
-    remote: A,
-    packet_buffer: &'a mut [u8; PACKET_SIZE],
-}
+pub enum Download {}
 
-impl<'a, A, S: UdpSocket<A>> Download<'a, S, A> {
-    pub async fn new(
-        filename: &str,
-        socket: &'a mut S,
-        remote: A,
-        packet_buffer: &'a mut [u8; PACKET_SIZE],
-    ) -> Self {
-        let mut download = Self {
-            socket,
-            remote,
-            packet_buffer,
-        };
-
-        let rrq = Packet::Rrq(Rwrq {
-            filename,
-            mode: todo!(),
-        });
-
-        todo!();
-
-        download
-    }
-
-    pub async fn receive_block(&mut self) -> Result<&[u8], DownloadError<'a, S, A>> {
-        todo!()
-    }
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct DownloadError<'a> {
+    pub kind: DownloadErrorKind<'a>,
 }
 
 #[derive(Debug)]
 #[non_exhaustive]
-pub struct DownloadError<'a, S: UdpSocket<A>, A> {
-    pub kind: DownloadErrorKind<'a, S, A>,
-}
-
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum DownloadErrorKind<'a, S: UdpSocket<A>, A> {
-    Io(S::ReceiveError),
-    Tftp(ProtocolError<'a>),
+pub enum DownloadErrorKind<'a> {
+    Protocol(ProtocolError<'a>),
     TransferComplete,
 }
 
-pub struct Upload<'a, S, A> {
-    socket: S,
-    address: A,
-    packet_buffer: &'a mut [u8; PACKET_SIZE],
-}
+pub enum Upload {}
 
-impl<'a, S: UdpSocket<A>, A> Upload<'a, S, A> {
-    pub async fn send_next_block(
-        &mut self,
-        block: &[u8; BLOCK_SIZE],
-    ) -> Result<&[u8], UploadError<'a, S, A>> {
-        todo!()
-    }
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct UploadError<'a> {
+    pub kind: UploadErrorKind<'a>,
 }
 
 #[derive(Debug)]
 #[non_exhaustive]
-pub struct UploadError<'a, S: UdpSocket<A>, A> {
-    pub kind: UploadErrorKind<'a, S, A>,
-}
-
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum UploadErrorKind<'a, S: UdpSocket<A>, A> {
-    Io(S::SendError),
+pub enum UploadErrorKind<'a> {
     Protocol(ProtocolError<'a>),
-}
-
-pub trait UdpSocket<A> {
-    type SendError: Debug;
-    type ReceiveError: Debug;
-
-    /// Send a datagram to the given destination.
-    fn send(
-        &mut self,
-        data: &[u8],
-        destination: Endpoint<A>,
-    ) -> impl Future<Output = Result<(), Self::SendError>>;
-
-    /// Receive a datagram into the provided `data` buffer.
-    ///
-    /// Returns the length in bytes and origin of the received datagram on success.
-    fn receive(
-        &mut self,
-        data: &mut [u8],
-    ) -> impl Future<Output = Result<(usize, Endpoint<A>), Self::SendError>>;
-}
-
-/// A UDP endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Endpoint<A> {
-    /// The address in the next layer below the transport layer.
-    address: A,
-    /// The transport layer port.
-    port: u16,
-}
-
-impl<A> From<(A, u16)> for Endpoint<A> {
-    fn from((address, port): (A, u16)) -> Self {
-        Self { address, port }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
