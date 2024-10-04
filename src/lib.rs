@@ -7,42 +7,99 @@ pub const BLOCK_SIZE: usize = 512;
 pub const HEADER_SIZE: usize = 4;
 pub const PACKET_SIZE: usize = BLOCK_SIZE + HEADER_SIZE;
 
-pub enum Download {}
+pub mod download {
+    use super::*;
+    pub enum Download {
+        PreInit(PreInit),
+    }
 
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct DownloadError<'a> {
-    pub kind: DownloadErrorKind<'a>,
+    struct PreInit {}
+
+    impl Download {
+        pub fn new(packet: &mut [u8; PACKET_SIZE], filename: &str, mode: Mode) -> Self {
+            Packet::Rrq(Rwrq {
+                filename: filename,
+                mode: (),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    #[non_exhaustive]
+    pub struct DownloadError<'a> {
+        pub kind: DownloadErrorKind<'a>,
+    }
+
+    #[derive(Debug)]
+    #[non_exhaustive]
+    pub enum DownloadErrorKind<'a> {
+        Protocol(ProtocolError<'a>),
+        TransferComplete,
+    }
+}
+
+pub mod upload {
+    use super::*;
+    pub enum Upload {}
+
+    #[derive(Debug)]
+    #[non_exhaustive]
+    pub struct UploadError<'a> {
+        pub kind: UploadErrorKind<'a>,
+    }
+
+    #[derive(Debug)]
+    #[non_exhaustive]
+    pub enum UploadErrorKind<'a> {
+        Protocol(ProtocolError<'a>),
+    }
 }
 
 #[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
 #[non_exhaustive]
-pub enum DownloadErrorKind<'a> {
-    Protocol(ProtocolError<'a>),
-    TransferComplete,
-}
-
-pub enum Upload {}
-
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct UploadError<'a> {
-    pub kind: UploadErrorKind<'a>,
+pub enum Encoding {
+    Netascii,
+    Octect,
 }
 
 #[derive(Debug)]
-#[non_exhaustive]
-pub enum UploadErrorKind<'a> {
-    Protocol(ProtocolError<'a>),
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
+pub struct FilenameError<'a> {
+    pub filename: &'a str,
+    pub kind: FilenameErrorKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FilenameErrorKind {
+    NullByte(NullByte),
+    Encoding(Encoding),
+}
+
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
+pub struct BufferTooSmall {
+    pub required_size: usize,
+    pub actual_size: usize,
+}
+
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
 pub struct ProtocolError<'a> {
     kind: ProtocolErrorKind,
     message: &'a str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
 pub enum ProtocolErrorKind {
     Undefined,
     FileNotFound,
@@ -54,7 +111,9 @@ pub enum ProtocolErrorKind {
     NoSuchUser,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
 enum Packet<'a> {
     Rrq(Rwrq<'a>),
     Wrq(Rwrq<'a>),
@@ -67,10 +126,10 @@ impl<'a> Packet<'a> {
     #[allow(unused)]
     pub fn bytes(&self) -> PacketBytes {
         match self {
-            Packet::Rrq(rwrq) | Packet::Wrq(rwrq) => PacketBytes::Rwrq(rwrq.bytes()),
-            Packet::Data(data) => PacketBytes::Data(data.bytes()),
-            Packet::Ack(ack) => PacketBytes::Ack(ack.bytes()),
-            Packet::Error(error) => PacketBytes::Error(error.bytes()),
+            | Packet::Rrq(rwrq) | Packet::Wrq(rwrq) => PacketBytes::Rwrq(rwrq.bytes()),
+            | Packet::Data(data) => PacketBytes::Data(data.bytes()),
+            | Packet::Ack(ack) => PacketBytes::Ack(ack.bytes()),
+            | Packet::Error(error) => PacketBytes::Error(error.bytes()),
         }
     }
 }
@@ -87,15 +146,17 @@ impl<'a> Iterator for PacketBytes<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            PacketBytes::Rwrq(rwrq_bytes) => rwrq_bytes.next(),
-            PacketBytes::Data(data_bytes) => data_bytes.next(),
-            PacketBytes::Ack(ack_bytes) => ack_bytes.next(),
-            PacketBytes::Error(error_bytes) => error_bytes.next(),
+            | PacketBytes::Rwrq(rwrq_bytes) => rwrq_bytes.next(),
+            | PacketBytes::Data(data_bytes) => data_bytes.next(),
+            | PacketBytes::Ack(ack_bytes) => ack_bytes.next(),
+            | PacketBytes::Error(error_bytes) => error_bytes.next(),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
 struct Rwrq<'a> {
     filename: &'a str,
     mode: &'a str,
@@ -131,7 +192,9 @@ impl<'a> Iterator for RwrqBytes<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
 struct Data<'a> {
     block_no: u16,
     data: &'a [u8],
@@ -143,6 +206,8 @@ impl<'a> Data<'a> {
     }
 }
 
+#[derive(Debug)]
+#[derive(Clone)]
 struct DataBytes<'a> {
     inner: core::iter::Chain<IntoIter<[u8; 2]>, core::iter::Copied<IntoIter<&'a [u8]>>>,
 }
@@ -167,7 +232,9 @@ impl<'a> Iterator for DataBytes<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
 struct Ack {
     block_no: u16,
 }
@@ -198,7 +265,9 @@ impl Iterator for AckBytes {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
 struct Error<'a> {
     error_code: u16,
     message: &'a str,
@@ -234,7 +303,9 @@ impl<'a> Iterator for ErrorBytes<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
 struct MalformedPacket;
 
 impl core::error::Error for MalformedPacket {}
@@ -245,7 +316,9 @@ impl Display for MalformedPacket {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
 enum Opcode {
     Rrq = 1,
     Wrq = 2,
@@ -259,16 +332,18 @@ impl TryFrom<u16> for Opcode {
 
     fn try_from(opcode: u16) -> Result<Self, UnknownOpcode> {
         Ok(match opcode {
-            1 => Self::Rrq,
-            2 => Self::Wrq,
-            3 => Self::Data,
-            4 => Self::Ack,
-            5 => Self::Error,
-            n => return Err(UnknownOpcode(n)),
+            | 1 => Self::Rrq,
+            | 2 => Self::Wrq,
+            | 3 => Self::Data,
+            | 4 => Self::Ack,
+            | 5 => Self::Error,
+            | n => return Err(UnknownOpcode(n)),
         })
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
 pub struct UnknownOpcode(pub u16);
 
 impl core::error::Error for UnknownOpcode {}
@@ -319,8 +394,8 @@ mod parser {
             take_while_m_n(0, block_size, |_| true),
         ))
         .map(|(_, block_no, data)| Packet::Data(Data { block_no, data }));
-        let ack =
-            tuple((opcode(Opcode::Ack), be_u16)).map(|(_, block_no)| Packet::Ack(Ack { block_no }));
+        let ack = tuple((opcode(Opcode::Ack), be_u16))
+            .map(|(_, block_no)| Packet::Ack(Ack { block_no }));
         let error = map_res(
             tuple((opcode(Opcode::Error), be_u16, cstr())),
             |(_, error_code, message)| {
@@ -331,5 +406,9 @@ mod parser {
             },
         );
         alt((rrq, wrq, data, ack, error))
+    }
+
+    pub fn parse_mode<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Encoding> {
+        todo!()
     }
 }
