@@ -357,12 +357,13 @@ impl Display for UnknownOpcode {
 mod parser {
 
     use super::*;
-    use branch::*;
-    use bytes::streaming::*;
-    use combinator::*;
-    use nom::*;
-    use number::streaming::be_u16;
-    use sequence::tuple;
+    use nom::branch::*;
+    use nom::bytes::streaming::*;
+    use nom::combinator::*;
+    use nom::number::streaming::be_u16;
+    use nom::sequence::*;
+    use nom::IResult;
+    use nom::Parser;
 
     pub fn parse_packet<'a>(
         block_size: usize,
@@ -371,8 +372,8 @@ mod parser {
         let cstr = || take_until(b"\0" as &[u8]);
 
         let rrq = map_res(
-            tuple((opcode(Opcode::Rrq), cstr(), cstr())),
-            |(_opcode, filename, mode)| {
+            preceded(opcode(Opcode::Rrq), tuple((cstr(), cstr()))),
+            |(filename, mode)| {
                 Ok::<_, core::str::Utf8Error>(Packet::Rrq(Rwrq {
                     filename: core::str::from_utf8(filename)?,
                     mode: core::str::from_utf8(mode)?,
@@ -380,25 +381,24 @@ mod parser {
             },
         );
         let wrq = map_res(
-            tuple((opcode(Opcode::Wrq), cstr(), cstr())),
-            |(_, filename, mode)| {
+            preceded(opcode(Opcode::Wrq), tuple((cstr(), cstr()))),
+            |(filename, mode)| {
                 Ok::<_, core::str::Utf8Error>(Packet::Wrq(Rwrq {
                     filename: core::str::from_utf8(filename)?,
                     mode: core::str::from_utf8(mode)?,
                 }))
             },
         );
-        let data = tuple((
+        let data = preceded(
             opcode(Opcode::Data),
-            be_u16,
-            take_while_m_n(0, block_size, |_| true),
-        ))
-        .map(|(_, block_no, data)| Packet::Data(Data { block_no, data }));
-        let ack = tuple((opcode(Opcode::Ack), be_u16))
-            .map(|(_, block_no)| Packet::Ack(Ack { block_no }));
+            tuple((be_u16, take_while_m_n(0, block_size, |_| true))),
+        )
+        .map(|(block_no, data)| Packet::Data(Data { block_no, data }));
+        let ack = preceded(opcode(Opcode::Ack), be_u16)
+            .map(|block_no| Packet::Ack(Ack { block_no }));
         let error = map_res(
-            tuple((opcode(Opcode::Error), be_u16, cstr())),
-            |(_, error_code, message)| {
+            preceded(opcode(Opcode::Error), tuple((be_u16, cstr()))),
+            |(error_code, message)| {
                 Ok::<_, core::str::Utf8Error>(Packet::Error(Error {
                     error_code,
                     message: core::str::from_utf8(message)?,
@@ -409,6 +409,9 @@ mod parser {
     }
 
     pub fn parse_mode<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Encoding> {
-        todo!()
+        let netascii = value(Encoding::Netascii, tag_no_case("netascii"));
+        let octet = value(Encoding::Octect, tag_no_case("octet"));
+
+        alt((netascii, octet))
     }
 }
