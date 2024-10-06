@@ -7,3 +7,4 @@ rust-version = "1.81"
 
 [dependencies]
 nom = { version = "7.1.3", default-features = false }
+netascii = { git = "https://www.github.com/melvdlin/netascii.git" }

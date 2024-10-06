@@ -16,11 +16,17 @@ pub mod download {
     struct PreInit {}
 
     impl Download {
-        pub fn new(packet: &mut [u8; PACKET_SIZE], filename: &str, mode: Mode) -> Self {
+        pub fn new(
+            packet: &mut [u8; PACKET_SIZE],
+            filename: &str,
+            mode: Encoding,
+        ) -> Self {
             Packet::Rrq(Rwrq {
                 filename: filename,
-                mode: (),
-            })
+                mode: todo!(),
+            });
+
+            todo!()
         }
     }
 
@@ -77,7 +83,7 @@ pub struct FilenameError<'a> {
 #[derive(PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FilenameErrorKind {
-    NullByte(NullByte),
+    // NullByte(NullByte),
     Encoding(Encoding),
 }
 
@@ -365,50 +371,73 @@ mod parser {
     use nom::IResult;
     use nom::Parser;
 
-    pub fn parse_packet<'a>(
-        block_size: usize,
-    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Packet<'a>> {
-        let opcode = |opcode| tag((opcode as u16).to_be_bytes());
-        let cstr = || take_until(b"\0" as &[u8]);
+    pub fn parse_packet<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Packet<'a>> {
+        let rrq = rrq().map(Packet::Rrq);
+        let wrq = wrq().map(Packet::Wrq);
+        let data = data().map(Packet::Data);
+        let ack = ack().map(Packet::Ack);
+        let error = error().map(Packet::Error);
 
-        let rrq = map_res(
-            preceded(opcode(Opcode::Rrq), tuple((cstr(), cstr()))),
-            |(filename, mode)| {
-                Ok::<_, core::str::Utf8Error>(Packet::Rrq(Rwrq {
-                    filename: core::str::from_utf8(filename)?,
-                    mode: core::str::from_utf8(mode)?,
-                }))
-            },
-        );
-        let wrq = map_res(
-            preceded(opcode(Opcode::Wrq), tuple((cstr(), cstr()))),
-            |(filename, mode)| {
-                Ok::<_, core::str::Utf8Error>(Packet::Wrq(Rwrq {
-                    filename: core::str::from_utf8(filename)?,
-                    mode: core::str::from_utf8(mode)?,
-                }))
-            },
-        );
-        let data = preceded(
-            opcode(Opcode::Data),
-            tuple((be_u16, take_while_m_n(0, block_size, |_| true))),
-        )
-        .map(|(block_no, data)| Packet::Data(Data { block_no, data }));
-        let ack = preceded(opcode(Opcode::Ack), be_u16)
-            .map(|block_no| Packet::Ack(Ack { block_no }));
-        let error = map_res(
-            preceded(opcode(Opcode::Error), tuple((be_u16, cstr()))),
-            |(error_code, message)| {
-                Ok::<_, core::str::Utf8Error>(Packet::Error(Error {
-                    error_code,
-                    message: core::str::from_utf8(message)?,
-                }))
-            },
-        );
         alt((rrq, wrq, data, ack, error))
     }
 
-    pub fn parse_mode<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Encoding> {
+    pub fn rrq<'a>() -> impl Parser<&'a [u8], Rwrq<'a>, nom::error::Error<&'a [u8]>> {
+        map_res(
+            preceded(opcode(Opcode::Rrq), tuple((cstr(), cstr()))),
+            |(filename, mode)| {
+                Ok::<_, core::str::Utf8Error>(Rwrq {
+                    filename: core::str::from_utf8(filename)?,
+                    mode: core::str::from_utf8(mode)?,
+                })
+            },
+        )
+    }
+
+    pub fn rwq<'a>() -> impl Parser<&'a [u8], Rwrq<'a>, nom::error::Error<&'a [u8]>> {
+        map_res(
+            preceded(opcode(Opcode::Wrq), tuple((cstr(), cstr()))),
+            |(filename, mode)| {
+                Ok::<_, core::str::Utf8Error>(Rwrq {
+                    filename: core::str::from_utf8(filename)?,
+                    mode: core::str::from_utf8(mode)?,
+                })
+            },
+        )
+    }
+
+    pub fn data<'a>() -> impl Parser<&'a [u8], Data<'a>, nom::error::Error<&'a [u8]>> {
+        preceded(opcode(Opcode::Data), tuple((be_u16, rest)))
+            .map(|(block_no, data)| Data { block_no, data })
+    }
+
+    pub fn ack<'a>() -> impl Parser<&'a [u8], Ack, nom::error::Error<&'a [u8]>> {
+        preceded(opcode(Opcode::Ack), be_u16).map(|block_no| Ack { block_no })
+    }
+
+    pub fn error<'a>() -> impl Parser<&'a [u8], Error<'a>, nom::error::Error<&'a [u8]>> {
+        map_res(
+            preceded(opcode(Opcode::Error), tuple((be_u16, cstr()))),
+            |(error_code, message)| {
+                Ok::<_, core::str::Utf8Error>(Error {
+                    error_code,
+                    message: core::str::from_utf8(message)?,
+                })
+            },
+        )
+    }
+
+    fn opcode<'a>(
+        opcode: Opcode,
+    ) -> impl Parser<&'a [u8], &'a [u8], nom::error::Error<&'a [u8]>> {
+        tag((opcode as u16).to_be_bytes())
+    }
+
+    fn cstr<'a>() -> impl Parser<&'a [u8], &'a [u8], nom::error::Error<&'a [u8]>> {
+        take_until(b"\0" as &[u8])
+    }
+
+    pub fn parse_mode<'a>() -> impl Parser<&'a [u8], Encoding, nom::error::Error<&'a [u8]>>
+    {
         let netascii = value(Encoding::Netascii, tag_no_case("netascii"));
         let octet = value(Encoding::Octect, tag_no_case("octet"));
 

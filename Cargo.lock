@@ -15,6 +15,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "netascii"
+version = "0.1.0"
+source = "git+https://www.github.com/melvdlin/netascii.git#6eb4bcc6f66c23cb8b37a5b116970714eaaa2070"
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -28,5 +33,6 @@ dependencies = [
 name = "tftpc"
 version = "0.0.0"
 dependencies = [
+ "netascii",
  "nom",
 ]
