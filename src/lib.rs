@@ -1,7 +1,8 @@
 use core::fmt::{Debug, Display};
 
+use nom::InputIter;
+
 type IntoIter<T> = <T as IntoIterator>::IntoIter;
-type CStrBytes<'a> = core::iter::Chain<core::str::Bytes<'a>, core::iter::Once<u8>>;
 
 pub const BLOCK_SIZE: usize = 512;
 pub const HEADER_SIZE: usize = 4;
@@ -16,17 +17,47 @@ pub mod download {
     struct PreInit {}
 
     impl Download {
-        pub fn new(
+        pub fn new<'filename>(
             packet: &mut [u8; PACKET_SIZE],
-            filename: &str,
+            filename: &'filename str,
             mode: Encoding,
-        ) -> Self {
-            Packet::Rrq(Rwrq {
-                filename: filename,
-                mode: todo!(),
-            });
+        ) -> Result<Self, NewDownloadError<'filename>> {
+            if let Some(position) = filename.bytes().position(|c| c == b'\0') {
+                return Err(NewDownloadError {
+                    kind: NewDownloadErrorKind::Filename(FilenameError {
+                        filename,
+                        kind: FilenameErrorKind::NullByte(NullByteError { position }),
+                    }),
+                });
+            }
 
-            todo!()
+            let rwrq = Rwrq {
+                filename,
+                mode: mode.as_str(),
+            };
+
+            debug_assert!(is_netascii(rwrq.mode.bytes()));
+
+            let opcode_bytes = (Opcode::Rrq as u16).to_be_bytes();
+            let (opcode_buf, rest) = packet.split_at_mut(opcode_bytes.len());
+        }
+    }
+
+    #[derive(Debug)]
+    #[non_exhaustive]
+    pub struct NewDownloadError<'a> {
+        pub kind: NewDownloadErrorKind<'a>,
+    }
+
+    #[derive(Debug)]
+    #[non_exhaustive]
+    pub enum NewDownloadErrorKind<'a> {
+        Filename(FilenameError<'a>),
+    }
+
+    impl<'filename> From<FilenameError<'filename>> for NewDownloadErrorKind<'filename> {
+        fn from(filename: FilenameError<'filename>) -> Self {
+            NewDownloadErrorKind::Filename(filename)
         }
     }
 
@@ -42,6 +73,18 @@ pub mod download {
         Protocol(ProtocolError<'a>),
         TransferComplete,
     }
+}
+
+fn is_netascii(bytes: impl IntoIterator<Item = u8> + Clone) -> bool {
+    let mut netascii = netascii::Netascii::from_bytes(bytes.clone());
+    let mut bytes = bytes.into_iter();
+    while let [Some(netascii), Some(bytes)] = [netascii.next(), bytes.next()] {
+        if netascii != bytes {
+            return false;
+        }
+    }
+
+    netascii.next().is_none() && bytes.next().is_none()
 }
 
 pub mod upload {
@@ -64,18 +107,15 @@ pub mod upload {
 #[derive(Debug)]
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Encoding {
-    Netascii,
-    Octect,
+pub struct FilenameError<'filename> {
+    pub filename: &'filename str,
+    pub kind: FilenameErrorKind,
 }
 
-#[derive(Debug)]
-#[derive(Clone, Copy)]
-#[derive(PartialEq, Eq)]
-pub struct FilenameError<'a> {
-    pub filename: &'a str,
-    pub kind: FilenameErrorKind,
+impl<'filename> Display for FilenameError<'filename> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "illegal filename '{}'", self.filename)
+    }
 }
 
 #[derive(Debug)]
@@ -83,9 +123,70 @@ pub struct FilenameError<'a> {
 #[derive(PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FilenameErrorKind {
-    // NullByte(NullByte),
-    Encoding(Encoding),
+    NullByte(NullByteError),
+    TooLong(TooLongError),
 }
+
+impl From<NullByteError> for FilenameErrorKind {
+    fn from(null_byte: NullByteError) -> Self {
+        FilenameErrorKind::NullByte(null_byte)
+    }
+}
+
+impl From<TooLongError> for FilenameErrorKind {
+    fn from(too_long: TooLongError) -> Self {
+        FilenameErrorKind::TooLong(too_long)
+    }
+}
+
+/// An [`Error`](core::error::Error) type indicating that a byte string contains an illegal null byte.
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
+pub struct NullByteError {
+    position: usize,
+}
+
+impl Display for NullByteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sequence contains an illegal null byte at position {}",
+            self.position
+        )
+    }
+}
+
+impl core::error::Error for NullByteError {}
+
+/// An [`Error`](core::error::Error) type indicating that a sequence of data exceeds some maximum length.
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
+pub struct TooLongError {
+    pub actual_len: Option<usize>,
+    pub max_len: usize,
+}
+
+impl Display for TooLongError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(actual) = self.actual_len {
+            write!(
+                f,
+                "sequence is too long (maximum len: {}; actual len: {})",
+                self.max_len, actual
+            )
+        } else {
+            write!(
+                f,
+                "sequence is too long (maximum len: {}; actual len > `usize::MAX`)",
+                self.max_len
+            )
+        }
+    }
+}
+
+impl core::error::Error for TooLongError {}
 
 #[derive(Debug)]
 #[derive(Clone, Copy)]
@@ -120,12 +221,30 @@ pub enum ProtocolErrorKind {
 #[derive(Debug)]
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
-enum Packet<'a> {
-    Rrq(Rwrq<'a>),
-    Wrq(Rwrq<'a>),
-    Data(Data<'a>),
+enum Packet<'buf> {
+    Rrq(Rwrq<'buf>),
+    Wrq(Rwrq<'buf>),
+    Data(Data<'buf>),
     Ack(Ack),
-    Error(Error<'a>),
+    Error(Error<'buf>),
+}
+
+impl<'buf> From<Data<'buf>> for Packet<'buf> {
+    fn from(data: Data<'buf>) -> Self {
+        Packet::Data(data)
+    }
+}
+
+impl<'buf> From<Ack> for Packet<'buf> {
+    fn from(ack: Ack) -> Self {
+        Packet::Ack(ack)
+    }
+}
+
+impl<'buf> From<Error<'buf>> for Packet<'buf> {
+    fn from(error: Error<'buf>) -> Self {
+        Packet::Error(error)
+    }
 }
 
 impl<'a> Packet<'a> {
@@ -168,25 +287,31 @@ struct Rwrq<'a> {
     mode: &'a str,
 }
 
-impl<'a> Rwrq<'a> {
-    pub fn bytes(&self) -> RwrqBytes {
-        RwrqBytes::new(self)
-    }
-}
-
 struct RwrqBytes<'a> {
-    inner: core::iter::Chain<CStrBytes<'a>, CStrBytes<'a>>,
+    pub filename: CStrBytes<'a>,
+    pub mode: CStrBytes<'a>,
 }
 
 impl<'a> RwrqBytes<'a> {
-    pub fn new(rwrq: &'a Rwrq) -> Self {
-        RwrqBytes {
-            inner: rwrq
-                .filename
-                .bytes()
-                .chain(core::iter::once(0))
-                .chain(rwrq.mode.bytes().chain(core::iter::once(b'\0'))),
+    pub fn new(rwrq: &'a Rwrq) -> Result<Self, RwrqBytesError> {
+        let filename = match CStrBytes::from_str(rwrq.filename) {
+            | Ok(filename) => filename,
+            | Err(e) => return Err(RwrqBytesError::Filename(e)),
+        };
+
+        let mode = match CStrBytes::from_str(rwrq.mode) {
+            | Ok(mode) => mode,
+            | Err(e) => return Err(RwrqBytesError::Mode(e)),
+        };
+
+        if filename.len().checked_add(mode.len()).is_none() {
+            return Err(RwrqBytesError::TooLong(TooLongError {
+                actual_len: None,
+                max_len: usize::MAX,
+            }));
         }
+
+        Ok(Self { filename, mode })
     }
 }
 
@@ -194,7 +319,134 @@ impl<'a> Iterator for RwrqBytes<'a> {
     type Item = u8;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        self.filename.next().or_else(|| self.mode.next())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl<'a> ExactSizeIterator for RwrqBytes<'a> {
+    fn len(&self) -> usize {
+        self.filename.len() + self.mode.len()
+    }
+}
+
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
+enum RwrqBytesError {
+    Filename(CStrBytesError),
+    Mode(CStrBytesError),
+    TooLong(TooLongError),
+}
+
+impl Display for RwrqBytesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`RwrqBytes` creation failed (cause: {})",
+            match self {
+                | RwrqBytesError::Filename(_) => "filename",
+                | RwrqBytesError::Mode(_) => "mode",
+                | RwrqBytesError::TooLong(_) => "combined length of filename and mode",
+            }
+        )
+    }
+}
+
+impl core::error::Error for RwrqBytesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match self {
+            | RwrqBytesError::Filename(e) => e,
+            | RwrqBytesError::Mode(e) => e,
+            | RwrqBytesError::TooLong(e) => e,
+        })
+    }
+}
+
+struct CStrBytes<'str> {
+    str: core::str::Bytes<'str>,
+    nul: core::iter::Once<u8>,
+}
+
+impl<'str> CStrBytes<'str> {
+    pub fn from_str(str: &'str str) -> Result<Self, CStrBytesError> {
+        let nul = core::iter::once(b'\0');
+        let max_str_len = usize::MAX - nul.len();
+        if str.len() > max_str_len {
+            return Err(TooLongError {
+                actual_len: Some(str.len()),
+                max_len: max_str_len,
+            }
+            .into());
+        }
+
+        if let Some(position) = str.bytes().position(|c| c == b'\0') {
+            return Err(NullByteError { position }.into());
+        }
+
+        Ok(Self {
+            str: str.bytes(),
+            nul,
+        })
+    }
+}
+
+impl<'str> Iterator for CStrBytes<'str> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.str.next().or_else(|| self.nul.next())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl<'str> ExactSizeIterator for CStrBytes<'str> {
+    fn len(&self) -> usize {
+        self.str.len() + self.nul.len()
+    }
+}
+
+/// An [`Error`](core::error::Error) that can occur when creating a [`CStrBytes`] iterator.
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
+enum CStrBytesError {
+    NullByte(NullByteError),
+    TooLong(TooLongError),
+}
+
+impl From<NullByteError> for CStrBytesError {
+    fn from(null_byte: NullByteError) -> Self {
+        CStrBytesError::NullByte(null_byte)
+    }
+}
+
+impl From<TooLongError> for CStrBytesError {
+    fn from(too_long: TooLongError) -> Self {
+        CStrBytesError::TooLong(too_long)
+    }
+}
+
+impl Display for CStrBytesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "`CStrBytes` creation failed")
+    }
+}
+
+impl core::error::Error for CStrBytesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match self {
+            | CStrBytesError::NullByte(e) => e,
+            | CStrBytesError::TooLong(e) => e,
+        })
     }
 }
 
@@ -360,6 +612,24 @@ impl Display for UnknownOpcode {
     }
 }
 
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Encoding {
+    Netascii,
+    Octect,
+}
+
+impl Encoding {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            | Encoding::Netascii => "netascii",
+            | Encoding::Octect => "octet",
+        }
+    }
+}
+
 mod parser {
 
     use super::*;
@@ -393,7 +663,7 @@ mod parser {
         )
     }
 
-    pub fn rwq<'a>() -> impl Parser<&'a [u8], Rwrq<'a>, nom::error::Error<&'a [u8]>> {
+    pub fn wrq<'a>() -> impl Parser<&'a [u8], Rwrq<'a>, nom::error::Error<&'a [u8]>> {
         map_res(
             preceded(opcode(Opcode::Wrq), tuple((cstr(), cstr()))),
             |(filename, mode)| {
@@ -428,18 +698,24 @@ mod parser {
 
     fn opcode<'a>(
         opcode: Opcode,
-    ) -> impl Parser<&'a [u8], &'a [u8], nom::error::Error<&'a [u8]>> {
-        tag((opcode as u16).to_be_bytes())
+    ) -> impl Parser<&'a [u8], Opcode, nom::error::Error<&'a [u8]>> {
+        value(opcode, tag((opcode as u16).to_be_bytes()))
     }
 
     fn cstr<'a>() -> impl Parser<&'a [u8], &'a [u8], nom::error::Error<&'a [u8]>> {
         take_until(b"\0" as &[u8])
     }
 
-    pub fn parse_mode<'a>() -> impl Parser<&'a [u8], Encoding, nom::error::Error<&'a [u8]>>
+    pub fn mode<'a>(
+        mode: Encoding,
+    ) -> impl Parser<&'a str, Encoding, nom::error::Error<&'a str>> {
+        value(mode, tag_no_case(mode.as_str()))
+    }
+
+    pub fn parse_mode<'a>() -> impl Parser<&'a str, Encoding, nom::error::Error<&'a str>>
     {
-        let netascii = value(Encoding::Netascii, tag_no_case("netascii"));
-        let octet = value(Encoding::Octect, tag_no_case("octet"));
+        let netascii = mode(Encoding::Netascii);
+        let octet = mode(Encoding::Octect);
 
         alt((netascii, octet))
     }
