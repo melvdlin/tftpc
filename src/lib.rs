@@ -1,6 +1,5 @@
 use core::fmt::{Debug, Display};
-
-use nom::InputIter;
+use std::{ffi::CStr, usize};
 
 type IntoIter<T> = <T as IntoIterator>::IntoIter;
 
@@ -283,26 +282,19 @@ impl<'a> Iterator for PacketBytes<'a> {
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
 struct Rwrq<'a> {
-    filename: &'a str,
-    mode: &'a str,
+    filename: &'a CStr,
+    mode: &'a CStr,
 }
 
 struct RwrqBytes<'a> {
-    pub filename: CStrBytes<'a>,
-    pub mode: CStrBytes<'a>,
+    filename: CStrBytes<'a>,
+    mode: CStrBytes<'a>,
 }
 
 impl<'a> RwrqBytes<'a> {
     pub fn new(rwrq: &'a Rwrq) -> Result<Self, RwrqBytesError> {
-        let filename = match CStrBytes::from_str(rwrq.filename) {
-            | Ok(filename) => filename,
-            | Err(e) => return Err(RwrqBytesError::Filename(e)),
-        };
-
-        let mode = match CStrBytes::from_str(rwrq.mode) {
-            | Ok(mode) => mode,
-            | Err(e) => return Err(RwrqBytesError::Mode(e)),
-        };
+        let filename = CStrBytes::from_cstr(rwrq.filename);
+        let mode = CStrBytes::from_cstr(rwrq.mode);
 
         if filename.len().checked_add(mode.len()).is_none() {
             return Err(RwrqBytesError::TooLong(TooLongError {
@@ -312,6 +304,14 @@ impl<'a> RwrqBytes<'a> {
         }
 
         Ok(Self { filename, mode })
+    }
+
+    pub fn filename(&mut self) -> &mut (impl ExactSizeIterator<Item = u8> + 'a) {
+        &mut self.filename
+    }
+
+    pub fn mode(&mut self) -> &mut (impl ExactSizeIterator<Item = u8> + 'a) {
+        &mut self.mode
     }
 }
 
@@ -338,8 +338,6 @@ impl<'a> ExactSizeIterator for RwrqBytes<'a> {
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
 enum RwrqBytesError {
-    Filename(CStrBytesError),
-    Mode(CStrBytesError),
     TooLong(TooLongError),
 }
 
@@ -349,8 +347,6 @@ impl Display for RwrqBytesError {
             f,
             "`RwrqBytes` creation failed (cause: {})",
             match self {
-                | RwrqBytesError::Filename(_) => "filename",
-                | RwrqBytesError::Mode(_) => "mode",
                 | RwrqBytesError::TooLong(_) => "combined length of filename and mode",
             }
         )
@@ -360,38 +356,22 @@ impl Display for RwrqBytesError {
 impl core::error::Error for RwrqBytesError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(match self {
-            | RwrqBytesError::Filename(e) => e,
-            | RwrqBytesError::Mode(e) => e,
             | RwrqBytesError::TooLong(e) => e,
         })
     }
 }
 
 struct CStrBytes<'str> {
-    str: core::str::Bytes<'str>,
-    nul: core::iter::Once<u8>,
+    cstr: &'str [u8],
+    next: Option<usize>,
 }
 
 impl<'str> CStrBytes<'str> {
-    pub fn from_str(str: &'str str) -> Result<Self, CStrBytesError> {
-        let nul = core::iter::once(b'\0');
-        let max_str_len = usize::MAX - nul.len();
-        if str.len() > max_str_len {
-            return Err(TooLongError {
-                actual_len: Some(str.len()),
-                max_len: max_str_len,
-            }
-            .into());
+    pub fn from_cstr(cstr: &'str CStr) -> Self {
+        Self {
+            cstr: cstr.to_bytes(),
+            next: Some(0),
         }
-
-        if let Some(position) = str.bytes().position(|c| c == b'\0') {
-            return Err(NullByteError { position }.into());
-        }
-
-        Ok(Self {
-            str: str.bytes(),
-            nul,
-        })
     }
 }
 
@@ -399,7 +379,12 @@ impl<'str> Iterator for CStrBytes<'str> {
     type Item = u8;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.str.next().or_else(|| self.nul.next())
+        let next = self.next?;
+        let next_byte = self.cstr.get(next).copied();
+        if next_byte.is_some() {
+            self.next = next.checked_add(1);
+        }
+        next_byte
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -410,43 +395,8 @@ impl<'str> Iterator for CStrBytes<'str> {
 
 impl<'str> ExactSizeIterator for CStrBytes<'str> {
     fn len(&self) -> usize {
-        self.str.len() + self.nul.len()
-    }
-}
-
-/// An [`Error`](core::error::Error) that can occur when creating a [`CStrBytes`] iterator.
-#[derive(Debug)]
-#[derive(Clone, Copy)]
-#[derive(PartialEq, Eq)]
-enum CStrBytesError {
-    NullByte(NullByteError),
-    TooLong(TooLongError),
-}
-
-impl From<NullByteError> for CStrBytesError {
-    fn from(null_byte: NullByteError) -> Self {
-        CStrBytesError::NullByte(null_byte)
-    }
-}
-
-impl From<TooLongError> for CStrBytesError {
-    fn from(too_long: TooLongError) -> Self {
-        CStrBytesError::TooLong(too_long)
-    }
-}
-
-impl Display for CStrBytesError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "`CStrBytes` creation failed")
-    }
-}
-
-impl core::error::Error for CStrBytesError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(match self {
-            | CStrBytesError::NullByte(e) => e,
-            | CStrBytesError::TooLong(e) => e,
-        })
+        let Some(next) = self.next else { return 0 };
+        self.cstr.len() - next
     }
 }
 
@@ -458,27 +408,34 @@ struct Data<'a> {
     data: &'a [u8],
 }
 
-impl<'a> Data<'a> {
-    pub fn bytes(&self) -> DataBytes {
-        DataBytes::new(self)
-    }
-}
-
 #[derive(Debug)]
 #[derive(Clone)]
 struct DataBytes<'a> {
-    inner: core::iter::Chain<IntoIter<[u8; 2]>, core::iter::Copied<IntoIter<&'a [u8]>>>,
+    block_no: IntoIter<[u8; 2]>,
+    data: core::iter::Copied<IntoIter<&'a [u8]>>,
 }
 
 impl<'a> DataBytes<'a> {
-    pub fn new(data: &'a Data) -> Self {
-        DataBytes {
-            inner: data
-                .block_no
-                .to_be_bytes()
-                .into_iter()
-                .chain(data.data.iter().copied()),
+    pub fn new(data: &'a Data) -> Result<Self, TooLongError> {
+        let block_no = data.block_no.to_be_bytes().into_iter();
+        let data = data.data.iter().copied();
+
+        if block_no.len().checked_add(data.len()).is_none() {
+            return Err(TooLongError {
+                actual_len: None,
+                max_len: usize::MAX,
+            });
         }
+
+        Ok(DataBytes { block_no, data })
+    }
+
+    pub fn block_no(&mut self) -> &mut impl ExactSizeIterator<Item = u8> {
+        &mut self.block_no
+    }
+
+    pub fn data(&mut self) -> &mut (impl ExactSizeIterator<Item = u8> + 'a) {
+        &mut self.data
     }
 }
 
@@ -486,7 +443,18 @@ impl<'a> Iterator for DataBytes<'a> {
     type Item = u8;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        self.block_no.next().or_else(|| self.data.next())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl<'a> ExactSizeIterator for DataBytes<'a> {
+    fn len(&self) -> usize {
+        self.block_no.len() + self.data.len()
     }
 }
 
@@ -504,14 +472,18 @@ impl Ack {
 }
 
 struct AckBytes {
-    inner: IntoIter<[u8; 2]>,
+    block_no: IntoIter<[u8; 2]>,
 }
 
 impl AckBytes {
     pub fn new(ack: &Ack) -> Self {
         Self {
-            inner: ack.block_no.to_be_bytes().into_iter(),
+            block_no: ack.block_no.to_be_bytes().into_iter(),
         }
+    }
+
+    pub fn block_no(&mut self) -> &mut impl ExactSizeIterator<Item = u8> {
+        &mut self.block_no
     }
 }
 
@@ -519,7 +491,18 @@ impl Iterator for AckBytes {
     type Item = u8;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        self.block_no.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for AckBytes {
+    fn len(&self) -> usize {
+        self.block_no.len()
     }
 }
 
@@ -528,28 +511,30 @@ impl Iterator for AckBytes {
 #[derive(PartialEq, Eq)]
 struct Error<'a> {
     error_code: u16,
-    message: &'a str,
-}
-
-impl<'a> Error<'a> {
-    pub fn bytes(&self) -> ErrorBytes {
-        ErrorBytes::new(self)
-    }
+    message: &'a CStr,
 }
 
 struct ErrorBytes<'a> {
-    inner: core::iter::Chain<IntoIter<[u8; 2]>, CStrBytes<'a>>,
+    error_code: IntoIter<[u8; 2]>,
+    message: CStrBytes<'a>,
 }
 
 impl<'a> ErrorBytes<'a> {
-    pub fn new(error: &'a Error) -> Self {
-        Self {
-            inner: error
-                .error_code
-                .to_be_bytes()
-                .into_iter()
-                .chain(error.message.bytes().chain(core::iter::once(b'\0'))),
+    pub fn new(error: &'a Error) -> Result<Self, TooLongError> {
+        let error_code = error.error_code.to_be_bytes().into_iter();
+        let message = CStrBytes::from_cstr(error.message);
+
+        if error_code.len().checked_add(message.len()).is_none() {
+            return Err(TooLongError {
+                actual_len: None,
+                max_len: usize::MAX,
+            });
         }
+
+        Ok(Self {
+            error_code,
+            message,
+        })
     }
 }
 
@@ -557,7 +542,18 @@ impl<'a> Iterator for ErrorBytes<'a> {
     type Item = u8;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        self.error_code.next().or_else(|| self.message.next())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl<'a> ExactSizeIterator for ErrorBytes<'a> {
+    fn len(&self) -> usize {
+        self.error_code.len() + self.message.len()
     }
 }
 
@@ -655,9 +651,9 @@ mod parser {
         map_res(
             preceded(opcode(Opcode::Rrq), tuple((cstr(), cstr()))),
             |(filename, mode)| {
-                Ok::<_, core::str::Utf8Error>(Rwrq {
-                    filename: core::str::from_utf8(filename)?,
-                    mode: core::str::from_utf8(mode)?,
+                Ok::<_, core::ffi::FromBytesWithNulError>(Rwrq {
+                    filename: CStr::from_bytes_with_nul(filename)?,
+                    mode: CStr::from_bytes_with_nul(mode)?,
                 })
             },
         )
@@ -667,9 +663,9 @@ mod parser {
         map_res(
             preceded(opcode(Opcode::Wrq), tuple((cstr(), cstr()))),
             |(filename, mode)| {
-                Ok::<_, core::str::Utf8Error>(Rwrq {
-                    filename: core::str::from_utf8(filename)?,
-                    mode: core::str::from_utf8(mode)?,
+                Ok::<_, core::ffi::FromBytesWithNulError>(Rwrq {
+                    filename: CStr::from_bytes_with_nul(filename)?,
+                    mode: CStr::from_bytes_with_nul(mode)?,
                 })
             },
         )
@@ -703,6 +699,7 @@ mod parser {
     }
 
     fn cstr<'a>() -> impl Parser<&'a [u8], &'a [u8], nom::error::Error<&'a [u8]>> {
+        todo!("include nul byte");
         take_until(b"\0" as &[u8])
     }
 
