@@ -12,6 +12,8 @@ const BLOCK_NO_SIZE: usize = size_of::<u16>();
 pub const BLOCK_SIZE: usize = 512;
 
 pub mod download {
+    use nom::Parser;
+
     use super::*;
 
     pub fn new<'filename>(
@@ -36,11 +38,13 @@ pub mod download {
         for (buf, byte) in packet_bytes.by_ref().zip(opcode_bytes.by_ref()) {
             *buf = byte;
         }
-        // if this fails, a whole packet cannot fit an opcode,
-        // meaning we messed up either the `OpcodeBytes` iterator or `PACKET_SIZE`
-        debug_assert!(opcode_bytes.len() == 0);
+        debug_assert_eq!(
+            opcode_bytes.len(),
+            0,
+            "cannot fit opcode into packet, this is a bug"
+        );
 
-        debug_assert_eq!(rwrq_bytes.mode().len(), filename.to_bytes().len());
+        debug_assert_eq!(rwrq_bytes.filename().len(), filename.to_bytes().len());
 
         for (buf, byte) in packet_bytes.by_ref().zip(rwrq_bytes.by_ref()) {
             *buf = byte;
@@ -52,7 +56,7 @@ pub mod download {
             // than the opcode and the mode combined
             debug_assert!(
                 filename_len > 0,
-                "packet cannot fit filename null terminator; this is a bug"
+                "cannot fit filename null terminator into packet; this is a bug"
             );
 
             Err(FilenameError {
@@ -84,19 +88,6 @@ pub mod download {
     }
 
     #[derive(Debug)]
-    #[non_exhaustive]
-    pub struct DownloadError<'a> {
-        pub kind: DownloadErrorKind<'a>,
-    }
-
-    #[derive(Debug)]
-    #[non_exhaustive]
-    pub enum DownloadErrorKind<'a> {
-        Protocol(ProtocolError<'a>),
-        TransferComplete,
-    }
-
-    #[derive(Debug)]
     #[derive(Clone, Copy)]
     pub struct AwaitingData {
         block_id: u16,
@@ -106,10 +97,82 @@ pub mod download {
         pub fn process<'rx, 'tx>(
             rx: &'rx [u8],
             tx: &'tx mut [u8; PACKET_SIZE],
-        ) -> (Result<(), ProtocolError<'rx>>, Option<usize>) {
+        ) -> (
+            Result<BlockRecieved<'rx>, DownloadError<'rx>>,
+            Option<usize>,
+        ) {
+            let malformed_packet = (Err(DownloadError::BadPacket), None);
+            let Ok((rest, packet)) = parser::packet().parse(rx) else {
+                return malformed_packet;
+            };
+            if !rest.is_empty() {
+                return malformed_packet;
+            }
+            let data = match packet {
+                | Packet::Data(Data { block_no, data }) => {
+                    todo!()
+                }
+                | _ => {
+                    let error = Packet::Error(Error {
+                        error_code: ErrorCode::IllegalOperation,
+                        message: c"",
+                    });
+                    let mut tx_bytes = tx.iter_mut();
+                    let mut error_bytes = PacketBytes::new(&error)
+                        .expect("error with message length == 0 should be smaller than `usize::MAX`");
+                    for (buf, byte) in tx_bytes.zip(error_bytes.by_ref()) {
+                        *buf = byte;
+                    }
+                    debug_assert_eq!(
+                        error_bytes.len(),
+                        0,
+                        "cannot fit error into TX buffer"
+                    );
+
+                    let unwritten = error_bytes.len();
+                    return (Err(DownloadError::BadPacket), Some(tx.len() - unwritten));
+                }
+            };
+
             todo!()
         }
     }
+
+    // possible outcomes:
+    // malformed packet  -> transfer failed (peer died), do nothing => BadPacket
+    // protocol error    -> transfer failed (we died),   do nothing => PeerTerminated
+    // illegal operation -> transfer failed (peer died), send error => BadPacket
+    // bad block number  -> transfer failed (peer died), send error => BadPacket
+    // full data block   -> data available,              send ack
+    // small data block  -> transfer complete,           send ack
+
+    pub enum BlockRecieved<'rx> {
+        Intermediate(AwaitingData, &'rx [u8; BLOCK_SIZE]),
+        Final(&'rx [u8]),
+    }
+
+    #[derive(Debug)]
+    #[derive(Clone)]
+    #[non_exhaustive]
+    pub enum DownloadError<'rx> {
+        BadPacket,
+        PeerTerminated(ProtocolError<'rx>),
+    }
+
+    impl<'a> Display for DownloadError<'a> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "download failed: {}",
+                match self {
+                    | DownloadError::BadPacket => "malformed packet",
+                    | DownloadError::PeerTerminated(_) => "peer terminated connection",
+                }
+            )
+        }
+    }
+
+    impl<'rx> core::error::Error for DownloadError<'rx> {}
 }
 
 fn is_netascii(bytes: impl IntoIterator<Item = u8> + Clone) -> bool {
@@ -212,22 +275,55 @@ pub struct BufferTooSmall {
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
 pub struct ProtocolError<'a> {
-    kind: ProtocolErrorKind,
+    code: ErrorCode,
     message: &'a CStr,
 }
 
 #[derive(Debug)]
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
-pub enum ProtocolErrorKind {
-    Undefined,
-    FileNotFound,
-    AccessViolation,
-    DiskFull,
-    IllegalOperation,
-    UnknownTransferID,
-    FileAlreadyExists,
-    NoSuchUser,
+pub enum ErrorCode {
+    Undefined = 0,
+    FileNotFound = 1,
+    AccessViolation = 2,
+    DiskFull = 3,
+    IllegalOperation = 4,
+    UnknownTransferID = 5,
+    FileAlreadyExists = 6,
+    NoSuchUser = 7,
+}
+
+impl TryFrom<u16> for ErrorCode {
+    type Error = UnknownErrorCode;
+
+    fn try_from(code: u16) -> Result<Self, Self::Error> {
+        [
+            ErrorCode::Undefined,
+            ErrorCode::FileNotFound,
+            ErrorCode::AccessViolation,
+            ErrorCode::DiskFull,
+            ErrorCode::IllegalOperation,
+            ErrorCode::UnknownTransferID,
+            ErrorCode::FileAlreadyExists,
+            ErrorCode::NoSuchUser,
+        ]
+        .into_iter()
+        .find_map(|error_code| (code == error_code as u16).then_some(error_code))
+        .ok_or(UnknownErrorCode(code))
+    }
+}
+
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
+pub struct UnknownErrorCode(pub u16);
+
+impl core::error::Error for UnknownErrorCode {}
+
+impl Display for UnknownErrorCode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "unknown error code ({})", self.0)
+    }
 }
 
 #[derive(Debug)]
@@ -611,16 +707,8 @@ impl ExactSizeIterator for AckBytes {
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
 struct Error<'a> {
-    error_code: u16,
+    error_code: ErrorCode,
     message: &'a CStr,
-}
-
-enum ErrorCode {
-    NotDefined,
-    FileNotFound,
-    AccessViolation,
-    DiskFull,
-    IllegalOperation,
 }
 
 #[derive(Debug)]
@@ -632,7 +720,7 @@ struct ErrorBytes<'a> {
 
 impl<'a> ErrorBytes<'a> {
     pub fn new(error: &'a Error) -> Result<Self, TooLongError> {
-        let error_code = error.error_code.to_be_bytes().into_iter();
+        let error_code = (error.error_code as u16).to_be_bytes().into_iter();
         let message = CStrBytes::from_cstr(error.message);
 
         if error_code.len().checked_add(message.len()).is_none() {
@@ -695,15 +783,17 @@ enum Opcode {
 impl TryFrom<u16> for Opcode {
     type Error = UnknownOpcode;
 
-    fn try_from(opcode: u16) -> Result<Self, UnknownOpcode> {
-        Ok(match opcode {
-            | 1 => Self::Rrq,
-            | 2 => Self::Wrq,
-            | 3 => Self::Data,
-            | 4 => Self::Ack,
-            | 5 => Self::Error,
-            | n => return Err(UnknownOpcode(n)),
-        })
+    fn try_from(code: u16) -> Result<Self, UnknownOpcode> {
+        [
+            Opcode::Rrq,
+            Opcode::Wrq,
+            Opcode::Data,
+            Opcode::Ack,
+            Opcode::Error,
+        ]
+        .into_iter()
+        .find_map(|opcode| (code == opcode as u16).then_some(opcode))
+        .ok_or(UnknownOpcode(code))
     }
 }
 
@@ -785,50 +875,64 @@ mod parser {
     use nom::IResult;
     use nom::Parser;
 
-    pub fn parse_packet<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Packet<'a>> {
-        let rrq = rrq().map(Packet::Rrq);
-        let wrq = wrq().map(Packet::Wrq);
-        let data = data().map(Packet::Data);
-        let ack = ack().map(Packet::Ack);
-        let error = error().map(Packet::Error);
+    pub fn packet<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Packet<'a>> {
+        let rrq = rrq_packet().map(Packet::Rrq);
+        let wrq = wrq_packet().map(Packet::Wrq);
+        let data = data_packet().map(Packet::Data);
+        let ack = ack_packet().map(Packet::Ack);
+        let error = error_packet().map(Packet::Error);
 
         alt((rrq, wrq, data, ack, error))
     }
 
-    pub fn rrq<'input>(
+    pub fn rrq_packet<'input>(
     ) -> impl Parser<&'input [u8], Rwrq<'input>, nom::error::Error<&'input [u8]>> {
-        preceded(opcode(Opcode::Rrq), tuple((cstr(), cstr())))
-            .map(|(filename, mode)| Rwrq { filename, mode })
+        preceded(opcode(Opcode::Rrq), rwrq())
     }
 
-    pub fn wrq<'input>(
+    pub fn wrq_packet<'input>(
     ) -> impl Parser<&'input [u8], Rwrq<'input>, nom::error::Error<&'input [u8]>> {
-        preceded(opcode(Opcode::Wrq), tuple((cstr(), cstr())))
-            .map(|(filename, mode)| Rwrq { filename, mode })
+        preceded(opcode(Opcode::Wrq), rwrq())
+    }
+
+    pub fn data_packet<'input>(
+    ) -> impl Parser<&'input [u8], Data<'input>, nom::error::Error<&'input [u8]>> {
+        preceded(opcode(Opcode::Data), data())
+    }
+
+    pub fn ack_packet<'input>(
+    ) -> impl Parser<&'input [u8], Ack, nom::error::Error<&'input [u8]>> {
+        preceded(opcode(Opcode::Ack), ack())
+    }
+
+    pub fn error_packet<'input>(
+    ) -> impl Parser<&'input [u8], Error<'input>, nom::error::Error<&'input [u8]>> {
+        preceded(opcode(Opcode::Error), error())
+    }
+
+    pub fn rwrq<'input>(
+    ) -> impl Parser<&'input [u8], Rwrq<'input>, nom::error::Error<&'input [u8]>> {
+        tuple((cstr(), cstr())).map(|(filename, mode)| Rwrq { filename, mode })
     }
 
     pub fn data<'input>(
     ) -> impl Parser<&'input [u8], Data<'input>, nom::error::Error<&'input [u8]>> {
-        preceded(opcode(Opcode::Data), tuple((be_u16, rest)))
-            .map(|(block_no, data)| Data { block_no, data })
+        tuple((be_u16, rest)).map(|(block_no, data)| Data { block_no, data })
     }
 
     pub fn ack<'input>() -> impl Parser<&'input [u8], Ack, nom::error::Error<&'input [u8]>>
     {
-        preceded(opcode(Opcode::Ack), be_u16).map(|block_no| Ack { block_no })
+        be_u16.map(|block_no| Ack { block_no })
     }
 
     pub fn error<'input>(
     ) -> impl Parser<&'input [u8], Error<'input>, nom::error::Error<&'input [u8]>> {
-        map_res(
-            preceded(opcode(Opcode::Error), tuple((be_u16, cstr()))),
-            |(error_code, message)| {
-                Ok::<_, core::str::Utf8Error>(Error {
-                    error_code,
-                    message,
-                })
-            },
-        )
+        map_res(tuple((be_u16, cstr())), |(error_code, message)| {
+            Ok::<_, UnknownErrorCode>(Error {
+                error_code: ErrorCode::try_from(error_code)?,
+                message,
+            })
+        })
     }
 
     fn opcode<'input>(
