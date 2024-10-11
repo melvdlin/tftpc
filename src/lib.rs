@@ -3,60 +3,83 @@ use std::{ffi::CStr, usize};
 
 type IntoIter<T> = <T as IntoIterator>::IntoIter;
 
+pub const PACKET_SIZE: usize = HEADER_SIZE + BLOCK_SIZE;
+
+const HEADER_SIZE: usize = OPCODE_SIZE + BLOCK_NO_SIZE;
+const OPCODE_SIZE: usize = size_of::<u16>();
+const BLOCK_NO_SIZE: usize = size_of::<u16>();
+
 pub const BLOCK_SIZE: usize = 512;
-pub const HEADER_SIZE: usize = 4;
-pub const PACKET_SIZE: usize = BLOCK_SIZE + HEADER_SIZE;
 
 pub mod download {
     use super::*;
-    pub enum Download {
-        PreInit(PreInit),
-    }
 
-    struct PreInit {}
+    pub fn new<'filename>(
+        packet: &mut [u8; PACKET_SIZE],
+        filename: &'filename CStr,
+        mode: Mode,
+    ) -> Result<(AwaitingData, usize), NewDownloadError<'filename>> {
+        let rwrq = Rwrq {
+            filename,
+            mode: mode.as_cstr(),
+        };
+        let mut rwrq_bytes = RwrqBytes::new(&rwrq).map_err(|e| FilenameError {
+            filename,
+            kind: e.into(),
+        })?;
 
-    impl Download {
-        pub fn new<'filename>(
-            packet: &mut [u8; PACKET_SIZE],
-            filename: &'filename str,
-            mode: Encoding,
-        ) -> Result<Self, NewDownloadError<'filename>> {
-            if let Some(position) = filename.bytes().position(|c| c == b'\0') {
-                return Err(NewDownloadError {
-                    kind: NewDownloadErrorKind::Filename(FilenameError {
-                        filename,
-                        kind: FilenameErrorKind::NullByte(NullByteError { position }),
-                    }),
-                });
-            }
+        let mut opcode_bytes = OpcodeBytes::new(Opcode::Rrq);
+        debug_assert!(is_netascii(rwrq_bytes.mode().clone()));
 
-            let rwrq = Rwrq {
+        let mut packet_bytes = packet.iter_mut();
+
+        for (buf, byte) in packet_bytes.by_ref().zip(opcode_bytes.by_ref()) {
+            *buf = byte;
+        }
+        // if this fails, a whole packet cannot fit an opcode,
+        // meaning we messed up either the `OpcodeBytes` iterator or `PACKET_SIZE`
+        debug_assert!(opcode_bytes.len() == 0);
+
+        debug_assert_eq!(rwrq_bytes.mode().len(), filename.to_bytes().len());
+
+        for (buf, byte) in packet_bytes.by_ref().zip(rwrq_bytes.by_ref()) {
+            *buf = byte;
+        }
+
+        if rwrq_bytes.len() > 0 {
+            let filename_len = filename.count_bytes();
+            // the packet should be significantly larger
+            // than the opcode and the mode combined
+            debug_assert!(
+                filename_len > 0,
+                "packet cannot fit filename null terminator; this is a bug"
+            );
+
+            Err(FilenameError {
                 filename,
-                mode: mode.as_str(),
-            };
-
-            debug_assert!(is_netascii(rwrq.mode.bytes()));
-
-            let opcode_bytes = (Opcode::Rrq as u16).to_be_bytes();
-            let (opcode_buf, rest) = packet.split_at_mut(opcode_bytes.len());
+                kind: TooLongError {
+                    actual_len: Some(filename_len),
+                    max_len: filename_len - rwrq_bytes.len(),
+                }
+                .into(),
+            }
+            .into())
+        } else {
+            let unwritten = packet_bytes.len();
+            let written = packet.len() - unwritten;
+            Ok((AwaitingData { block_id: 1 }, written))
         }
     }
 
     #[derive(Debug)]
     #[non_exhaustive]
-    pub struct NewDownloadError<'a> {
-        pub kind: NewDownloadErrorKind<'a>,
-    }
-
-    #[derive(Debug)]
-    #[non_exhaustive]
-    pub enum NewDownloadErrorKind<'a> {
+    pub enum NewDownloadError<'a> {
         Filename(FilenameError<'a>),
     }
 
-    impl<'filename> From<FilenameError<'filename>> for NewDownloadErrorKind<'filename> {
+    impl<'filename> From<FilenameError<'filename>> for NewDownloadError<'filename> {
         fn from(filename: FilenameError<'filename>) -> Self {
-            NewDownloadErrorKind::Filename(filename)
+            NewDownloadError::Filename(filename)
         }
     }
 
@@ -71,6 +94,21 @@ pub mod download {
     pub enum DownloadErrorKind<'a> {
         Protocol(ProtocolError<'a>),
         TransferComplete,
+    }
+
+    #[derive(Debug)]
+    #[derive(Clone, Copy)]
+    pub struct AwaitingData {
+        block_id: u16,
+    }
+
+    impl AwaitingData {
+        pub fn process<'rx, 'tx>(
+            rx: &'rx [u8],
+            tx: &'tx mut [u8; PACKET_SIZE],
+        ) -> (Result<(), ProtocolError<'rx>>, Option<usize>) {
+            todo!()
+        }
     }
 }
 
@@ -107,13 +145,15 @@ pub mod upload {
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
 pub struct FilenameError<'filename> {
-    pub filename: &'filename str,
+    pub filename: &'filename CStr,
     pub kind: FilenameErrorKind,
 }
 
 impl<'filename> Display for FilenameError<'filename> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "illegal filename '{}'", self.filename)
+        write!(f, "illegal filename '")?;
+        fmt_cstr(self.filename, f)?;
+        write!(f, "'")
     }
 }
 
@@ -122,14 +162,7 @@ impl<'filename> Display for FilenameError<'filename> {
 #[derive(PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FilenameErrorKind {
-    NullByte(NullByteError),
     TooLong(TooLongError),
-}
-
-impl From<NullByteError> for FilenameErrorKind {
-    fn from(null_byte: NullByteError) -> Self {
-        FilenameErrorKind::NullByte(null_byte)
-    }
 }
 
 impl From<TooLongError> for FilenameErrorKind {
@@ -137,26 +170,6 @@ impl From<TooLongError> for FilenameErrorKind {
         FilenameErrorKind::TooLong(too_long)
     }
 }
-
-/// An [`Error`](core::error::Error) type indicating that a byte string contains an illegal null byte.
-#[derive(Debug)]
-#[derive(Clone, Copy)]
-#[derive(PartialEq, Eq)]
-pub struct NullByteError {
-    position: usize,
-}
-
-impl Display for NullByteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "sequence contains an illegal null byte at position {}",
-            self.position
-        )
-    }
-}
-
-impl core::error::Error for NullByteError {}
 
 /// An [`Error`](core::error::Error) type indicating that a sequence of data exceeds some maximum length.
 #[derive(Debug)]
@@ -200,7 +213,7 @@ pub struct BufferTooSmall {
 #[derive(PartialEq, Eq)]
 pub struct ProtocolError<'a> {
     kind: ProtocolErrorKind,
-    message: &'a str,
+    message: &'a CStr,
 }
 
 #[derive(Debug)]
@@ -228,6 +241,18 @@ enum Packet<'buf> {
     Error(Error<'buf>),
 }
 
+impl<'buf> Packet<'buf> {
+    pub const fn opcode(&self) -> Opcode {
+        match self {
+            | Packet::Rrq(_) => Opcode::Rrq,
+            | Packet::Wrq(_) => Opcode::Wrq,
+            | Packet::Data(_) => Opcode::Data,
+            | Packet::Ack(_) => Opcode::Data,
+            | Packet::Error(_) => Opcode::Error,
+        }
+    }
+}
+
 impl<'buf> From<Data<'buf>> for Packet<'buf> {
     fn from(data: Data<'buf>) -> Self {
         Packet::Data(data)
@@ -246,34 +271,131 @@ impl<'buf> From<Error<'buf>> for Packet<'buf> {
     }
 }
 
-impl<'a> Packet<'a> {
+impl<'buf> Packet<'buf> {
     #[allow(unused)]
-    pub fn bytes(&self) -> PacketBytes {
-        match self {
-            | Packet::Rrq(rwrq) | Packet::Wrq(rwrq) => PacketBytes::Rwrq(rwrq.bytes()),
-            | Packet::Data(data) => PacketBytes::Data(data.bytes()),
-            | Packet::Ack(ack) => PacketBytes::Ack(ack.bytes()),
-            | Packet::Error(error) => PacketBytes::Error(error.bytes()),
+    pub fn bytes(&self) -> Result<PacketBytes, TooLongError> {
+        PacketBytes::new(self)
+    }
+}
+
+#[derive(Debug)]
+#[derive(Clone)]
+struct PacketBytes<'payload> {
+    opcode: OpcodeBytes,
+    payload: PayloadBytes<'payload>,
+}
+
+impl<'payload> PacketBytes<'payload> {
+    pub fn new(packet: &'payload Packet) -> Result<Self, TooLongError> {
+        let opcode = OpcodeBytes::new(packet.opcode());
+        let payload = PayloadBytes::new(packet)?;
+        if opcode.len().checked_add(payload.len()).is_none() {
+            return Err(TooLongError {
+                actual_len: None,
+                max_len: usize::MAX,
+            });
+        }
+        Ok(PacketBytes { opcode, payload })
+    }
+}
+
+impl<'payload> Iterator for PacketBytes<'payload> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.opcode.next().or_else(|| self.payload.next())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl<'a> ExactSizeIterator for PacketBytes<'a> {
+    fn len(&self) -> usize {
+        self.opcode.len() + self.payload.len()
+    }
+}
+
+#[derive(Debug)]
+#[derive(Clone)]
+struct OpcodeBytes {
+    inner: IntoIter<[u8; 2]>,
+}
+
+impl OpcodeBytes {
+    pub fn new(opcode: Opcode) -> Self {
+        Self {
+            inner: (opcode as u16).to_be_bytes().into_iter(),
         }
     }
 }
 
-enum PacketBytes<'a> {
+impl Iterator for OpcodeBytes {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for OpcodeBytes {
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+#[derive(Debug)]
+#[derive(Clone)]
+enum PayloadBytes<'a> {
     Rwrq(RwrqBytes<'a>),
     Data(DataBytes<'a>),
     Ack(AckBytes),
     Error(ErrorBytes<'a>),
 }
 
-impl<'a> Iterator for PacketBytes<'a> {
+impl<'a> PayloadBytes<'a> {
+    pub fn new(packet: &'a Packet) -> Result<Self, TooLongError> {
+        Ok(match packet {
+            | Packet::Rrq(rwrq) | Packet::Wrq(rwrq) => Self::Rwrq(RwrqBytes::new(rwrq)?),
+            | Packet::Data(data) => Self::Data(DataBytes::new(data)?),
+            | Packet::Ack(ack) => Self::Ack(AckBytes::new(ack)),
+            | Packet::Error(error) => Self::Error(ErrorBytes::new(error)?),
+        })
+    }
+}
+
+impl<'a> Iterator for PayloadBytes<'a> {
     type Item = u8;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            | PacketBytes::Rwrq(rwrq_bytes) => rwrq_bytes.next(),
-            | PacketBytes::Data(data_bytes) => data_bytes.next(),
-            | PacketBytes::Ack(ack_bytes) => ack_bytes.next(),
-            | PacketBytes::Error(error_bytes) => error_bytes.next(),
+            | PayloadBytes::Rwrq(rwrq_bytes) => rwrq_bytes.next(),
+            | PayloadBytes::Data(data_bytes) => data_bytes.next(),
+            | PayloadBytes::Ack(ack_bytes) => ack_bytes.next(),
+            | PayloadBytes::Error(error_bytes) => error_bytes.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl<'a> ExactSizeIterator for PayloadBytes<'a> {
+    fn len(&self) -> usize {
+        match self {
+            | PayloadBytes::Rwrq(inner) => inner.len(),
+            | PayloadBytes::Data(inner) => inner.len(),
+            | PayloadBytes::Ack(inner) => inner.len(),
+            | PayloadBytes::Error(inner) => inner.len(),
         }
     }
 }
@@ -286,31 +408,33 @@ struct Rwrq<'a> {
     mode: &'a CStr,
 }
 
+#[derive(Debug)]
+#[derive(Clone)]
 struct RwrqBytes<'a> {
     filename: CStrBytes<'a>,
     mode: CStrBytes<'a>,
 }
 
 impl<'a> RwrqBytes<'a> {
-    pub fn new(rwrq: &'a Rwrq) -> Result<Self, RwrqBytesError> {
+    pub fn new(rwrq: &'a Rwrq) -> Result<Self, TooLongError> {
         let filename = CStrBytes::from_cstr(rwrq.filename);
         let mode = CStrBytes::from_cstr(rwrq.mode);
 
         if filename.len().checked_add(mode.len()).is_none() {
-            return Err(RwrqBytesError::TooLong(TooLongError {
+            return Err(TooLongError {
                 actual_len: None,
                 max_len: usize::MAX,
-            }));
+            });
         }
 
         Ok(Self { filename, mode })
     }
 
-    pub fn filename(&mut self) -> &mut (impl ExactSizeIterator<Item = u8> + 'a) {
+    pub fn filename(&mut self) -> &mut (impl ExactSizeIterator<Item = u8> + Clone + 'a) {
         &mut self.filename
     }
 
-    pub fn mode(&mut self) -> &mut (impl ExactSizeIterator<Item = u8> + 'a) {
+    pub fn mode(&mut self) -> &mut (impl ExactSizeIterator<Item = u8> + Clone + 'a) {
         &mut self.mode
     }
 }
@@ -335,32 +459,7 @@ impl<'a> ExactSizeIterator for RwrqBytes<'a> {
 }
 
 #[derive(Debug)]
-#[derive(Clone, Copy)]
-#[derive(PartialEq, Eq)]
-enum RwrqBytesError {
-    TooLong(TooLongError),
-}
-
-impl Display for RwrqBytesError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "`RwrqBytes` creation failed (cause: {})",
-            match self {
-                | RwrqBytesError::TooLong(_) => "combined length of filename and mode",
-            }
-        )
-    }
-}
-
-impl core::error::Error for RwrqBytesError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(match self {
-            | RwrqBytesError::TooLong(e) => e,
-        })
-    }
-}
-
+#[derive(Clone)]
 struct CStrBytes<'str> {
     cstr: &'str [u8],
     next: Option<usize>,
@@ -471,6 +570,8 @@ impl Ack {
     }
 }
 
+#[derive(Debug)]
+#[derive(Clone)]
 struct AckBytes {
     block_no: IntoIter<[u8; 2]>,
 }
@@ -514,6 +615,16 @@ struct Error<'a> {
     message: &'a CStr,
 }
 
+enum ErrorCode {
+    NotDefined,
+    FileNotFound,
+    AccessViolation,
+    DiskFull,
+    IllegalOperation,
+}
+
+#[derive(Debug)]
+#[derive(Clone)]
 struct ErrorBytes<'a> {
     error_code: IntoIter<[u8; 2]>,
     message: CStrBytes<'a>,
@@ -595,6 +706,7 @@ impl TryFrom<u16> for Opcode {
         })
     }
 }
+
 #[derive(Debug)]
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
@@ -612,17 +724,53 @@ impl Display for UnknownOpcode {
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Encoding {
+pub enum Mode {
     Netascii,
     Octect,
 }
 
-impl Encoding {
+impl Mode {
     pub const fn as_str(self) -> &'static str {
         match self {
-            | Encoding::Netascii => "netascii",
-            | Encoding::Octect => "octet",
+            | Mode::Netascii => "netascii",
+            | Mode::Octect => "octet",
         }
+    }
+
+    pub const fn as_cstr(self) -> &'static CStr {
+        match self {
+            | Mode::Netascii => c"netascii",
+            | Mode::Octect => c"octet",
+        }
+    }
+}
+
+impl<'cstr> TryFrom<&'cstr CStr> for Mode {
+    type Error = UnknownMode<'cstr>;
+
+    fn try_from(cstr: &'cstr CStr) -> Result<Self, Self::Error> {
+        let bytes = cstr.to_bytes();
+        for mode in [Self::Netascii, Self::Octect] {
+            if bytes.eq_ignore_ascii_case(mode.as_cstr().to_bytes()) {
+                return Ok(mode);
+            }
+        }
+        Err(UnknownMode(cstr))
+    }
+}
+
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
+pub struct UnknownMode<'a>(&'a CStr);
+
+impl<'a> core::error::Error for UnknownMode<'a> {}
+
+impl<'a> Display for UnknownMode<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "unknown mode (",)?;
+        fmt_cstr(self.0, f)?;
+        write!(f, ")")
     }
 }
 
@@ -647,73 +795,89 @@ mod parser {
         alt((rrq, wrq, data, ack, error))
     }
 
-    pub fn rrq<'a>() -> impl Parser<&'a [u8], Rwrq<'a>, nom::error::Error<&'a [u8]>> {
-        map_res(
-            preceded(opcode(Opcode::Rrq), tuple((cstr(), cstr()))),
-            |(filename, mode)| {
-                Ok::<_, core::ffi::FromBytesWithNulError>(Rwrq {
-                    filename: CStr::from_bytes_with_nul(filename)?,
-                    mode: CStr::from_bytes_with_nul(mode)?,
-                })
-            },
-        )
+    pub fn rrq<'input>(
+    ) -> impl Parser<&'input [u8], Rwrq<'input>, nom::error::Error<&'input [u8]>> {
+        preceded(opcode(Opcode::Rrq), tuple((cstr(), cstr())))
+            .map(|(filename, mode)| Rwrq { filename, mode })
     }
 
-    pub fn wrq<'a>() -> impl Parser<&'a [u8], Rwrq<'a>, nom::error::Error<&'a [u8]>> {
-        map_res(
-            preceded(opcode(Opcode::Wrq), tuple((cstr(), cstr()))),
-            |(filename, mode)| {
-                Ok::<_, core::ffi::FromBytesWithNulError>(Rwrq {
-                    filename: CStr::from_bytes_with_nul(filename)?,
-                    mode: CStr::from_bytes_with_nul(mode)?,
-                })
-            },
-        )
+    pub fn wrq<'input>(
+    ) -> impl Parser<&'input [u8], Rwrq<'input>, nom::error::Error<&'input [u8]>> {
+        preceded(opcode(Opcode::Wrq), tuple((cstr(), cstr())))
+            .map(|(filename, mode)| Rwrq { filename, mode })
     }
 
-    pub fn data<'a>() -> impl Parser<&'a [u8], Data<'a>, nom::error::Error<&'a [u8]>> {
+    pub fn data<'input>(
+    ) -> impl Parser<&'input [u8], Data<'input>, nom::error::Error<&'input [u8]>> {
         preceded(opcode(Opcode::Data), tuple((be_u16, rest)))
             .map(|(block_no, data)| Data { block_no, data })
     }
 
-    pub fn ack<'a>() -> impl Parser<&'a [u8], Ack, nom::error::Error<&'a [u8]>> {
+    pub fn ack<'input>() -> impl Parser<&'input [u8], Ack, nom::error::Error<&'input [u8]>>
+    {
         preceded(opcode(Opcode::Ack), be_u16).map(|block_no| Ack { block_no })
     }
 
-    pub fn error<'a>() -> impl Parser<&'a [u8], Error<'a>, nom::error::Error<&'a [u8]>> {
+    pub fn error<'input>(
+    ) -> impl Parser<&'input [u8], Error<'input>, nom::error::Error<&'input [u8]>> {
         map_res(
             preceded(opcode(Opcode::Error), tuple((be_u16, cstr()))),
             |(error_code, message)| {
                 Ok::<_, core::str::Utf8Error>(Error {
                     error_code,
-                    message: core::str::from_utf8(message)?,
+                    message,
                 })
             },
         )
     }
 
-    fn opcode<'a>(
+    fn opcode<'input>(
         opcode: Opcode,
-    ) -> impl Parser<&'a [u8], Opcode, nom::error::Error<&'a [u8]>> {
+    ) -> impl Parser<&'input [u8], Opcode, nom::error::Error<&'input [u8]>> {
         value(opcode, tag((opcode as u16).to_be_bytes()))
     }
 
-    fn cstr<'a>() -> impl Parser<&'a [u8], &'a [u8], nom::error::Error<&'a [u8]>> {
-        todo!("include nul byte");
-        take_until(b"\0" as &[u8])
+    // adapted from nom::streaming::take_until
+    fn cstr() -> impl for<'input> Fn(
+        &'input [u8],
+    ) -> IResult<
+        &'input [u8],
+        &'input CStr,
+        nom::error::Error<&'input [u8]>,
+    > {
+        use nom::FindSubstring;
+        use nom::InputTake;
+
+        move |i: &[u8]| {
+            let Some(nul_pos) = i.find_substring(b"\0".as_slice()) else {
+                return Err(nom::Err::Incomplete(nom::Needed::Unknown));
+            };
+
+            let (cstr, rest) = i.take_split(nul_pos + 1);
+            let cstr = CStr::from_bytes_with_nul(cstr)
+                .expect("only nul byte should be at index + 1");
+            Ok((rest, cstr))
+        }
     }
 
-    pub fn mode<'a>(
-        mode: Encoding,
-    ) -> impl Parser<&'a str, Encoding, nom::error::Error<&'a str>> {
-        value(mode, tag_no_case(mode.as_str()))
+    pub fn mode<'input>(
+        mode: Mode,
+    ) -> impl Parser<&'input [u8], Mode, nom::error::Error<&'input [u8]>> {
+        value(mode, tag_no_case(mode.as_cstr().to_bytes_with_nul()))
     }
 
-    pub fn parse_mode<'a>() -> impl Parser<&'a str, Encoding, nom::error::Error<&'a str>>
-    {
-        let netascii = mode(Encoding::Netascii);
-        let octet = mode(Encoding::Octect);
+    pub fn parse_mode<'input>(
+    ) -> impl Parser<&'input [u8], Mode, nom::error::Error<&'input [u8]>> {
+        let netascii = mode(Mode::Netascii);
+        let octet = mode(Mode::Octect);
 
         alt((netascii, octet))
     }
+}
+
+fn fmt_cstr(cstr: &CStr, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    for c in cstr.to_bytes_with_nul().iter().copied().map(char::from) {
+        write!(f, "{}", c)?;
+    }
+    Ok(())
 }
