@@ -2,6 +2,7 @@
 #![allow(clippy::let_and_return)]
 #![forbid(unsafe_code, unused_must_use)]
 
+use core::error::Error;
 use core::ffi::CStr;
 use core::fmt::{Debug, Display};
 
@@ -16,6 +17,7 @@ const BLOCK_NO_SIZE: usize = size_of::<u16>();
 pub const BLOCK_SIZE: usize = 512;
 
 pub mod download {
+
     use nom::Parser;
 
     use super::*;
@@ -25,55 +27,32 @@ pub mod download {
         filename: &'filename CStr,
         mode: Mode,
     ) -> Result<(AwaitingData, usize), NewDownloadError<'filename>> {
-        let rwrq = Rwrq {
-            filename,
-            mode: mode.as_cstr(),
-        };
-        let mut rwrq_bytes = RwrqBytes::new(&rwrq).map_err(|e| FilenameError {
-            filename,
-            kind: e.into(),
-        })?;
-        debug_assert!(is_netascii(rwrq_bytes.mode().clone()));
-
-        let mut tx_bytes = tx.iter_mut();
-        let mut opcode_bytes = OpcodeBytes::new(Opcode::Rrq);
-        must_write(opcode_bytes.by_ref(), tx_bytes.by_ref(), "rrq opcode");
-
-        debug_assert_eq!(rwrq_bytes.filename().len(), filename.to_bytes().len());
-        for (buf, byte) in tx_bytes.by_ref().zip(rwrq_bytes.by_ref()) {
-            *buf = byte;
-        }
-
-        if rwrq_bytes.len() > 0 {
-            let filename_len = filename.count_bytes();
-            // the packet should be significantly larger
-            // than the opcode and the mode combined
-            debug_assert!(
-                filename_len > 0,
-                "cannot fit filename null terminator into packet; this is a bug"
-            );
-
-            Err(FilenameError {
-                filename,
-                kind: TooLongError {
-                    actual_len: Some(filename_len),
-                    max_len: filename_len - rwrq_bytes.len(),
-                }
-                .into(),
-            }
-            .into())
-        } else {
-            let unwritten = tx_bytes.len();
-            let written = tx.len() - unwritten;
-            Ok((AwaitingData { block_no: 1 }, written))
-        }
+        write_rwrq(Opcode::Rrq, tx, filename, mode)
+            .map(|written| (AwaitingData::new(), written))
+            .map_err(NewDownloadError::from)
     }
 
     #[derive(Debug)]
+    #[derive(Clone, Copy)]
+    #[derive(PartialEq, Eq)]
     #[non_exhaustive]
     pub enum NewDownloadError<'a> {
         Filename(FilenameError<'a>),
     }
+
+    impl<'a> Display for NewDownloadError<'a> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(
+                f,
+                "download initiation failed; cause: {}",
+                match self {
+                    | NewDownloadError::Filename(_) => "filename",
+                }
+            )
+        }
+    }
+
+    impl<'a> Error for NewDownloadError<'a> {}
 
     impl<'filename> From<FilenameError<'filename>> for NewDownloadError<'filename> {
         fn from(filename: FilenameError<'filename>) -> Self {
@@ -83,20 +62,25 @@ pub mod download {
 
     #[derive(Debug)]
     #[derive(Clone, Copy)]
+    #[derive(PartialEq, Eq)]
     pub struct AwaitingData {
         block_no: u16,
     }
 
     impl AwaitingData {
+        const fn new() -> Self {
+            AwaitingData { block_no: 1 }
+        }
+
         pub fn process<'rx>(
             self,
             rx: &'rx [u8],
             tx: &mut [u8; PACKET_SIZE],
         ) -> (
-            Result<BlockRecieved<'rx>, DownloadError<'rx>>,
+            Result<BlockRecieved<'rx>, TransferError<'rx>>,
             Option<usize>,
         ) {
-            let malformed_packet = (Err(DownloadError::BadPacket), None);
+            let malformed_packet = (Err(TransferError::BadPacket), None);
 
             let Some((&[], packet)) = parser::packet().parse(rx).ok() else {
                 return malformed_packet;
@@ -104,16 +88,17 @@ pub mod download {
 
             let Data { data, block_no } = match packet {
                 | Packet::Data(data) => data,
-                | Packet::Error(error) => return Self::peer_terminated(error),
-                | _ => return Self::illegal_op(c"illegal operation", tx),
+                | Packet::Error(error) => return peer_terminated(error),
+                | _ => return illegal_op(c"illegal operation", tx),
             };
 
             if data.len() > BLOCK_SIZE {
-                return Self::illegal_op(c"block too large", tx);
+                return illegal_op(c"block too large", tx);
             }
 
             if block_no != self.block_no {
-                return Self::illegal_op(c"bad block number", tx);
+                // we ignore both smaller and greater block numbers to support wrapping
+                return (Ok(BlockRecieved::Retransmission(self)), None);
             }
 
             let written =
@@ -131,40 +116,6 @@ pub mod download {
 
             (Ok(received), Some(written))
         }
-
-        fn illegal_op<'message, 'rx>(
-            message: &'message CStr,
-            tx: &mut [u8; PACKET_SIZE],
-        ) -> (
-            Result<BlockRecieved<'rx>, DownloadError<'message>>,
-            Option<usize>,
-        ) {
-            (
-                Err(DownloadError::BadPacket),
-                Some(must_write(
-                    Packet::Error(Error {
-                        error_code: ErrorCode::IllegalOperation,
-                        message,
-                    })
-                    .bytes()
-                    .expect("message too long"),
-                    tx,
-                    "error",
-                )),
-            )
-        }
-
-        fn peer_terminated(
-            error: Error,
-        ) -> (Result<BlockRecieved, DownloadError>, Option<usize>) {
-            (
-                Err(DownloadError::PeerTerminated(ProtocolError {
-                    code: error.error_code,
-                    message: error.message,
-                })),
-                None,
-            )
-        }
     }
 
     // possible outcomes:
@@ -175,33 +126,268 @@ pub mod download {
     // full data block   -> data available,              send ack
     // small data block  -> transfer complete,           send ack
 
+    #[derive(Debug)]
     pub enum BlockRecieved<'rx> {
         Intermediate(AwaitingData, &'rx [u8; BLOCK_SIZE]),
         Final(&'rx [u8]),
+        Retransmission(AwaitingData),
+    }
+}
+
+pub mod upload {
+    use nom::Parser;
+
+    use super::*;
+
+    pub fn new<'filename>(
+        tx: &mut [u8; PACKET_SIZE],
+        filename: &'filename CStr,
+        mode: Mode,
+    ) -> Result<(AwaitingAck, usize), NewUploadError<'filename>> {
+        write_rwrq(Opcode::Wrq, tx, filename, mode)
+            .map(|written| (AwaitingAck::new(), written))
+            .map_err(NewUploadError::from)
     }
 
     #[derive(Debug)]
-    #[derive(Clone)]
     #[non_exhaustive]
-    pub enum DownloadError<'rx> {
-        BadPacket,
-        PeerTerminated(ProtocolError<'rx>),
+    pub enum NewUploadError<'a> {
+        Filename(FilenameError<'a>),
     }
 
-    impl<'a> Display for DownloadError<'a> {
+    impl<'a> Display for NewUploadError<'a> {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             write!(
                 f,
-                "download failed: {}",
+                "download initiation failed; cause: {}",
                 match self {
-                    | DownloadError::BadPacket => "malformed packet",
-                    | DownloadError::PeerTerminated(_) => "peer terminated connection",
+                    | NewUploadError::Filename(_) => "filename",
                 }
             )
         }
     }
 
-    impl<'rx> core::error::Error for DownloadError<'rx> {}
+    impl<'a> Error for NewUploadError<'a> {}
+
+    impl<'filename> From<FilenameError<'filename>> for NewUploadError<'filename> {
+        fn from(filename: FilenameError<'filename>) -> Self {
+            NewUploadError::Filename(filename)
+        }
+    }
+
+    #[derive(Debug)]
+    #[derive(Clone, Copy)]
+    #[derive(PartialEq, Eq)]
+    pub struct AwaitingAck {
+        block_no: u16,
+    }
+
+    impl AwaitingAck {
+        const fn new() -> Self {
+            AwaitingAck { block_no: 0 }
+        }
+
+        pub fn process<'rx>(
+            self,
+            rx: &'rx [u8],
+            tx: &mut [u8; PACKET_SIZE],
+            data: impl IntoIterator<Item = u8>
+        ) -> (Result<AckReceived, TransferError<'rx>>, Option<usize>) {
+            let malformed_packet = (Err(TransferError::BadPacket), None);
+
+            let Some((&[], packet)) = parser::packet().parse(rx).ok() else {
+                return malformed_packet;
+            };
+
+            let Ack { block_no } = match packet {
+                | Packet::Ack(ack) => ack,
+                | Packet::Error(error) => return peer_terminated(error),
+                | _ => return illegal_op(c"illegal operation", tx),
+            };
+
+            if block_no != self.block_no {
+                // we ignore both smaller and greater block numbers to support wrapping
+                return (Ok(AckReceived::Retransmission(self)), None);
+            }
+
+            let mut bytes = data.into_iter().take(BLOCK_SIZE);
+            if bytes.len() == 0 {
+                return (Ok(AckReceived::TransferComplete), None);
+            }
+
+            let written = must_write(bytes, tx, name)
+
+            todo!()
+        }
+    }
+
+    // possible outcomes:
+    // malformed packet                     -> transfer failed (peer died), do nothing => BadPacket
+    // protocol error                       -> transfer failed (we died),   do nothing => PeerTerminated
+    // illegal operation                    -> transfer failed (peer died), send error => BadPacket
+    // bad block number                     -> retransmission,              do nothing => Retransmission
+    // correct block number, data available -> send next block                         => NextBlock
+    // correct block number, no more data   -> transfer complete                       => TransferComplete
+
+    #[derive(Debug)]
+    pub enum AckReceived {
+        NextBlock(AwaitingAck),
+        TransferComplete,
+        Retransmission(AwaitingAck),
+    }
+
+    #[derive(Debug)]
+    #[derive(Clone, Copy)]
+    #[derive(PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum UploadError<'rx> {
+        BadPacket,
+        Peer(PeerError<'rx>),
+    }
+
+    impl<'a> Display for UploadError<'a> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(
+                f,
+                "download failed: {}",
+                match self {
+                    | UploadError::BadPacket => "malformed packet",
+                    | UploadError::Peer(_) => "peer terminated connection",
+                }
+            )
+        }
+    }
+
+    impl<'rx> Error for UploadError<'rx> {}
+}
+
+fn illegal_op<'message, 'rx, T>(
+    message: &'message CStr,
+    tx: &mut [u8; PACKET_SIZE],
+) -> (Result<T, TransferError<'message>>, Option<usize>) {
+    (
+        Err(TransferError::BadPacket),
+        Some(must_write(
+            Packet::Error(ProtocolError {
+                code: ErrorCode::IllegalOperation,
+                message,
+            })
+            .bytes()
+            .expect("message too long"),
+            tx,
+            "error",
+        )),
+    )
+}
+
+fn peer_terminated<T>(error: ProtocolError) -> (Result<T, TransferError>, Option<usize>) {
+    (Err(TransferError::Peer(error.into())), None)
+}
+
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TransferError<'rx> {
+    BadPacket,
+    Peer(PeerError<'rx>),
+}
+
+impl<'a> Display for TransferError<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "download failed: {}",
+            match self {
+                | TransferError::BadPacket => "malformed packet",
+                | TransferError::Peer(_) => "peer terminated connection",
+            }
+        )
+    }
+}
+
+impl<'rx> Error for TransferError<'rx> {}
+
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
+pub struct PeerError<'message> {
+    pub code: ErrorCode,
+    pub message: &'message CStr,
+}
+
+impl<'message> Display for PeerError<'message> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "TFTP error: '{}' ({}), '{}'",
+            self.code,
+            self.code as u16,
+            self.message.display(),
+        )
+    }
+}
+
+impl<'message> Error for PeerError<'message> {}
+
+impl<'message> From<ProtocolError<'message>> for PeerError<'message> {
+    fn from(error: ProtocolError<'message>) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+        }
+    }
+}
+
+fn write_rwrq<'filename>(
+    opcode: Opcode,
+    tx: &mut [u8; PACKET_SIZE],
+    filename: &'filename CStr,
+    mode: Mode,
+) -> Result<usize, FilenameError<'filename>> {
+    debug_assert!(matches!(opcode, Opcode::Rrq | Opcode::Wrq));
+
+    let rwrq = Rwrq {
+        filename,
+        mode: mode.as_cstr(),
+    };
+    let mut rwrq_bytes = RwrqBytes::new(&rwrq).map_err(|e| FilenameError {
+        filename,
+        kind: e.into(),
+    })?;
+    debug_assert!(is_netascii(rwrq_bytes.mode().clone()));
+
+    let mut tx_bytes = tx.iter_mut();
+    let mut opcode_bytes = OpcodeBytes::new(opcode);
+    must_write(opcode_bytes.by_ref(), tx_bytes.by_ref(), "rrq opcode");
+
+    debug_assert_eq!(rwrq_bytes.filename().len(), filename.to_bytes().len());
+    for (buf, byte) in tx_bytes.by_ref().zip(rwrq_bytes.by_ref()) {
+        *buf = byte;
+    }
+
+    if rwrq_bytes.len() > 0 {
+        let filename_len = filename.count_bytes();
+        // the packet should be significantly larger
+        // than the opcode and the mode combined
+        debug_assert!(
+            filename_len > 0,
+            "cannot fit filename null terminator into packet; this is a bug"
+        );
+
+        Err(FilenameError {
+            filename,
+            kind: TooLongError {
+                actual_len: Some(filename_len),
+                max_len: filename_len - rwrq_bytes.len(),
+            }
+            .into(),
+        })
+    } else {
+        let unwritten = tx_bytes.len();
+        let written = tx.len() - unwritten;
+        Ok(written)
+    }
 }
 
 fn is_netascii(bytes: impl IntoIterator<Item = u8> + Clone) -> bool {
@@ -234,23 +420,6 @@ fn must_write<'tx>(
     written
 }
 
-pub mod upload {
-    use super::*;
-    pub enum Upload {}
-
-    #[derive(Debug)]
-    #[non_exhaustive]
-    pub struct UploadError<'a> {
-        pub kind: UploadErrorKind<'a>,
-    }
-
-    #[derive(Debug)]
-    #[non_exhaustive]
-    pub enum UploadErrorKind<'a> {
-        Protocol(ProtocolError<'a>),
-    }
-}
-
 #[derive(Debug)]
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
@@ -261,9 +430,7 @@ pub struct FilenameError<'filename> {
 
 impl<'filename> Display for FilenameError<'filename> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "illegal filename '")?;
-        fmt_cstr(self.filename, f)?;
-        write!(f, "'")
+        write!(f, "illegal filename '{}'", self.filename.display())
     }
 }
 
@@ -281,7 +448,7 @@ impl From<TooLongError> for FilenameErrorKind {
     }
 }
 
-/// An [`Error`](core::error::Error) type indicating that a sequence of data exceeds some maximum length.
+/// An [`Error`](Error) type indicating that a sequence of data exceeds some maximum length.
 #[derive(Debug)]
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
@@ -308,7 +475,7 @@ impl Display for TooLongError {
     }
 }
 
-impl core::error::Error for TooLongError {}
+impl Error for TooLongError {}
 
 #[derive(Debug)]
 #[derive(Clone, Copy)]
@@ -321,14 +488,8 @@ pub struct BufferTooSmall {
 #[derive(Debug)]
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
-pub struct ProtocolError<'a> {
-    code: ErrorCode,
-    message: &'a CStr,
-}
-
-#[derive(Debug)]
-#[derive(Clone, Copy)]
-#[derive(PartialEq, Eq)]
+#[derive(PartialOrd, Ord)]
+#[derive(Hash)]
 pub enum ErrorCode {
     Undefined = 0,
     FileNotFound = 1,
@@ -338,6 +499,25 @@ pub enum ErrorCode {
     UnknownTransferID = 5,
     FileAlreadyExists = 6,
     NoSuchUser = 7,
+}
+
+impl Display for ErrorCode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                | ErrorCode::Undefined => "Not defined, see error message (if any).",
+                | ErrorCode::FileNotFound => "File not found.",
+                | ErrorCode::AccessViolation => "Access violation.",
+                | ErrorCode::DiskFull => "Disk full or allocation exceeded.",
+                | ErrorCode::IllegalOperation => "Illegal TFTP operation.",
+                | ErrorCode::UnknownTransferID => "Unknown transfer ID.",
+                | ErrorCode::FileAlreadyExists => "File already exists.",
+                | ErrorCode::NoSuchUser => "No such user.",
+            }
+        )
+    }
 }
 
 impl TryFrom<u16> for ErrorCode {
@@ -365,7 +545,7 @@ impl TryFrom<u16> for ErrorCode {
 #[derive(PartialEq, Eq)]
 pub struct UnknownErrorCode(pub u16);
 
-impl core::error::Error for UnknownErrorCode {}
+impl Error for UnknownErrorCode {}
 
 impl Display for UnknownErrorCode {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -381,7 +561,7 @@ enum Packet<'buf> {
     Wrq(Rwrq<'buf>),
     Data(Data<'buf>),
     Ack(Ack),
-    Error(Error<'buf>),
+    Error(ProtocolError<'buf>),
 }
 
 impl<'buf> Packet<'buf> {
@@ -408,8 +588,8 @@ impl<'buf> From<Ack> for Packet<'buf> {
     }
 }
 
-impl<'buf> From<Error<'buf>> for Packet<'buf> {
-    fn from(error: Error<'buf>) -> Self {
+impl<'buf> From<ProtocolError<'buf>> for Packet<'buf> {
+    fn from(error: ProtocolError<'buf>) -> Self {
         Packet::Error(error)
     }
 }
@@ -755,8 +935,8 @@ impl ExactSizeIterator for AckBytes {
 #[derive(Debug)]
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
-struct Error<'a> {
-    error_code: ErrorCode,
+struct ProtocolError<'a> {
+    code: ErrorCode,
     message: &'a CStr,
 }
 
@@ -769,8 +949,8 @@ struct ErrorBytes<'a> {
 
 impl<'a> ErrorBytes<'a> {
     /// Returns an error iff the error payload would yield more than `usize::MAX` bytes
-    pub fn new(error: &'a Error) -> Result<Self, TooLongError> {
-        let error_code = (error.error_code as u16).to_be_bytes().into_iter();
+    pub fn new(error: &'a ProtocolError) -> Result<Self, TooLongError> {
+        let error_code = (error.code as u16).to_be_bytes().into_iter();
         let message = CStrBytes::from_cstr(error.message);
 
         if error_code.len().checked_add(message.len()).is_none() {
@@ -839,7 +1019,7 @@ impl TryFrom<u16> for Opcode {
 #[derive(PartialEq, Eq)]
 pub struct UnknownOpcode(pub u16);
 
-impl core::error::Error for UnknownOpcode {}
+impl Error for UnknownOpcode {}
 
 impl Display for UnknownOpcode {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -891,13 +1071,11 @@ impl<'cstr> TryFrom<&'cstr CStr> for Mode {
 #[derive(PartialEq, Eq)]
 pub struct UnknownMode<'a>(&'a CStr);
 
-impl<'a> core::error::Error for UnknownMode<'a> {}
+impl<'a> Error for UnknownMode<'a> {}
 
 impl<'a> Display for UnknownMode<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "unknown mode (",)?;
-        fmt_cstr(self.0, f)?;
-        write!(f, ")")
+        write!(f, "unknown mode '{}'", self.0.display())
     }
 }
 
@@ -943,7 +1121,8 @@ mod parser {
     }
 
     pub fn error_packet<'input>(
-    ) -> impl Parser<&'input [u8], Error<'input>, nom::error::Error<&'input [u8]>> {
+    ) -> impl Parser<&'input [u8], ProtocolError<'input>, nom::error::Error<&'input [u8]>>
+    {
         preceded(opcode(Opcode::Error), error())
     }
 
@@ -963,10 +1142,11 @@ mod parser {
     }
 
     pub fn error<'input>(
-    ) -> impl Parser<&'input [u8], Error<'input>, nom::error::Error<&'input [u8]>> {
+    ) -> impl Parser<&'input [u8], ProtocolError<'input>, nom::error::Error<&'input [u8]>>
+    {
         map_res(tuple((be_u16, cstr())), |(error_code, message)| {
-            Ok::<_, UnknownErrorCode>(Error {
-                error_code: ErrorCode::try_from(error_code)?,
+            Ok::<_, UnknownErrorCode>(ProtocolError {
+                code: ErrorCode::try_from(error_code)?,
                 message,
             })
         })
@@ -1016,9 +1196,27 @@ mod parser {
     }
 }
 
-fn fmt_cstr(cstr: &CStr, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    for c in cstr.to_bytes_with_nul().iter().copied().map(char::from) {
-        write!(f, "{}", c)?;
+#[derive(Debug)]
+#[derive(Clone, Copy)]
+#[derive(PartialEq, Eq)]
+#[derive(PartialOrd, Ord)]
+struct DisplayCStr<'cstr>(pub &'cstr CStr);
+
+impl<'cstr> Display for DisplayCStr<'cstr> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for c in self.0.to_bytes_with_nul().iter().copied().map(char::from) {
+            write!(f, "{}", c)?;
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+trait DisplayExt {
+    fn display(&self) -> impl Display;
+}
+
+impl DisplayExt for &CStr {
+    fn display(&self) -> impl Display {
+        DisplayCStr(self)
+    }
 }
