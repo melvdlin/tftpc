@@ -1,5 +1,6 @@
 #![no_std]
 #![allow(clippy::let_and_return)]
+#![forbid(unsafe_code, unused_must_use)]
 
 use core::ffi::CStr;
 use core::fmt::{Debug, Display};
@@ -414,7 +415,6 @@ impl<'buf> From<Error<'buf>> for Packet<'buf> {
 }
 
 impl<'buf> Packet<'buf> {
-    #[allow(unused)]
     pub fn bytes(&self) -> Result<PacketBytes, TooLongError> {
         PacketBytes::new(self)
     }
@@ -809,19 +809,6 @@ impl<'a> ExactSizeIterator for ErrorBytes<'a> {
 #[derive(Debug)]
 #[derive(Clone, Copy)]
 #[derive(PartialEq, Eq)]
-struct MalformedPacket;
-
-impl core::error::Error for MalformedPacket {}
-
-impl Display for MalformedPacket {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "malformed packet")
-    }
-}
-
-#[derive(Debug)]
-#[derive(Clone, Copy)]
-#[derive(PartialEq, Eq)]
 enum Opcode {
     Rrq = 1,
     Wrq = 2,
@@ -924,8 +911,6 @@ mod parser {
     use nom::sequence::*;
     use nom::IResult;
     use nom::Parser;
-
-    pub use nom::combinator::all_consuming as eof_after;
 
     pub fn packet<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Packet<'a>> {
         let rrq = rrq_packet().map(Packet::Rrq);
