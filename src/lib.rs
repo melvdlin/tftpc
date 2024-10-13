@@ -1,5 +1,8 @@
+#![no_std]
+#![allow(clippy::let_and_return)]
+
+use core::ffi::CStr;
 use core::fmt::{Debug, Display};
-use std::{ffi::CStr, usize};
 
 type IntoIter<T> = <T as IntoIterator>::IntoIter;
 
@@ -17,7 +20,7 @@ pub mod download {
     use super::*;
 
     pub fn new<'filename>(
-        packet: &mut [u8; PACKET_SIZE],
+        tx: &mut [u8; PACKET_SIZE],
         filename: &'filename CStr,
         mode: Mode,
     ) -> Result<(AwaitingData, usize), NewDownloadError<'filename>> {
@@ -29,24 +32,14 @@ pub mod download {
             filename,
             kind: e.into(),
         })?;
-
-        let mut opcode_bytes = OpcodeBytes::new(Opcode::Rrq);
         debug_assert!(is_netascii(rwrq_bytes.mode().clone()));
 
-        let mut packet_bytes = packet.iter_mut();
-
-        for (buf, byte) in packet_bytes.by_ref().zip(opcode_bytes.by_ref()) {
-            *buf = byte;
-        }
-        debug_assert_eq!(
-            opcode_bytes.len(),
-            0,
-            "cannot fit opcode into packet, this is a bug"
-        );
+        let mut tx_bytes = tx.iter_mut();
+        let mut opcode_bytes = OpcodeBytes::new(Opcode::Rrq);
+        must_write(opcode_bytes.by_ref(), tx_bytes.by_ref(), "rrq opcode");
 
         debug_assert_eq!(rwrq_bytes.filename().len(), filename.to_bytes().len());
-
-        for (buf, byte) in packet_bytes.by_ref().zip(rwrq_bytes.by_ref()) {
+        for (buf, byte) in tx_bytes.by_ref().zip(rwrq_bytes.by_ref()) {
             *buf = byte;
         }
 
@@ -69,9 +62,9 @@ pub mod download {
             }
             .into())
         } else {
-            let unwritten = packet_bytes.len();
-            let written = packet.len() - unwritten;
-            Ok((AwaitingData { block_id: 1 }, written))
+            let unwritten = tx_bytes.len();
+            let written = tx.len() - unwritten;
+            Ok((AwaitingData { block_no: 1 }, written))
         }
     }
 
@@ -90,51 +83,86 @@ pub mod download {
     #[derive(Debug)]
     #[derive(Clone, Copy)]
     pub struct AwaitingData {
-        block_id: u16,
+        block_no: u16,
     }
 
     impl AwaitingData {
-        pub fn process<'rx, 'tx>(
+        pub fn process<'rx>(
+            self,
             rx: &'rx [u8],
-            tx: &'tx mut [u8; PACKET_SIZE],
+            tx: &mut [u8; PACKET_SIZE],
         ) -> (
             Result<BlockRecieved<'rx>, DownloadError<'rx>>,
             Option<usize>,
         ) {
             let malformed_packet = (Err(DownloadError::BadPacket), None);
-            let Ok((rest, packet)) = parser::packet().parse(rx) else {
+
+            let Some((&[], packet)) = parser::packet().parse(rx).ok() else {
                 return malformed_packet;
             };
-            if !rest.is_empty() {
-                return malformed_packet;
+
+            let Data { data, block_no } = match packet {
+                | Packet::Data(data) => data,
+                | Packet::Error(error) => return Self::peer_terminated(error),
+                | _ => return Self::illegal_op(c"illegal operation", tx),
+            };
+
+            if data.len() > BLOCK_SIZE {
+                return Self::illegal_op(c"block too large", tx);
             }
-            let data = match packet {
-                | Packet::Data(Data { block_no, data }) => {
-                    todo!()
-                }
-                | _ => {
-                    let error = Packet::Error(Error {
-                        error_code: ErrorCode::IllegalOperation,
-                        message: c"",
-                    });
-                    let mut tx_bytes = tx.iter_mut();
-                    let mut error_bytes = PacketBytes::new(&error)
-                        .expect("error with message length == 0 should be smaller than `usize::MAX`");
-                    for (buf, byte) in tx_bytes.zip(error_bytes.by_ref()) {
-                        *buf = byte;
-                    }
-                    debug_assert_eq!(
-                        error_bytes.len(),
-                        0,
-                        "cannot fit error into TX buffer"
-                    );
 
-                    let unwritten = error_bytes.len();
-                    return (Err(DownloadError::BadPacket), Some(tx.len() - unwritten));
-                }
+            if block_no != self.block_no {
+                return Self::illegal_op(c"bad block number", tx);
+            }
+
+            let written =
+                must_write(Packet::Ack(Ack { block_no }).bytes().unwrap(), tx, "ack");
+            let received = if let Ok(intermediate) = <&[u8; BLOCK_SIZE]>::try_from(data) {
+                BlockRecieved::Intermediate(
+                    AwaitingData {
+                        block_no: block_no.wrapping_add(1),
+                    },
+                    intermediate,
+                )
+            } else {
+                BlockRecieved::Final(data)
             };
 
-            todo!()
+            (Ok(received), Some(written))
+        }
+
+        fn illegal_op<'message, 'rx>(
+            message: &'message CStr,
+            tx: &mut [u8; PACKET_SIZE],
+        ) -> (
+            Result<BlockRecieved<'rx>, DownloadError<'message>>,
+            Option<usize>,
+        ) {
+            (
+                Err(DownloadError::BadPacket),
+                Some(must_write(
+                    Packet::Error(Error {
+                        error_code: ErrorCode::IllegalOperation,
+                        message,
+                    })
+                    .bytes()
+                    .expect("message too long"),
+                    tx,
+                    "error",
+                )),
+            )
+        }
+
+        fn peer_terminated(
+            error: Error,
+        ) -> (Result<BlockRecieved, DownloadError>, Option<usize>) {
+            (
+                Err(DownloadError::PeerTerminated(ProtocolError {
+                    code: error.error_code,
+                    message: error.message,
+                })),
+                None,
+            )
         }
     }
 
@@ -160,7 +188,7 @@ pub mod download {
     }
 
     impl<'a> Display for DownloadError<'a> {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             write!(
                 f,
                 "download failed: {}",
@@ -185,6 +213,24 @@ fn is_netascii(bytes: impl IntoIterator<Item = u8> + Clone) -> bool {
     }
 
     netascii.next().is_none() && bytes.next().is_none()
+}
+
+fn must_write<'tx>(
+    bytes: impl IntoIterator<Item = u8, IntoIter: ExactSizeIterator>,
+    tx: impl IntoIterator<Item = &'tx mut u8, IntoIter: ExactSizeIterator>,
+    name: impl core::fmt::Display,
+) -> usize {
+    let mut bytes = bytes.into_iter();
+    let mut tx_bytes = tx.into_iter();
+    let tx_len = tx_bytes.len();
+    for (buf, byte) in tx_bytes.by_ref().zip(bytes.by_ref()) {
+        *buf = byte;
+    }
+    assert_eq!(bytes.len(), 0, "cannot fit `{name}` into TX buffer");
+
+    let unwritten = tx_bytes.len();
+    let written = tx_len - unwritten;
+    written
 }
 
 pub mod upload {
@@ -213,7 +259,7 @@ pub struct FilenameError<'filename> {
 }
 
 impl<'filename> Display for FilenameError<'filename> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "illegal filename '")?;
         fmt_cstr(self.filename, f)?;
         write!(f, "'")
@@ -244,7 +290,7 @@ pub struct TooLongError {
 }
 
 impl Display for TooLongError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if let Some(actual) = self.actual_len {
             write!(
                 f,
@@ -308,7 +354,7 @@ impl TryFrom<u16> for ErrorCode {
             ErrorCode::NoSuchUser,
         ]
         .into_iter()
-        .find_map(|error_code| (code == error_code as u16).then_some(error_code))
+        .find(|error_code| code == *error_code as u16)
         .ok_or(UnknownErrorCode(code))
     }
 }
@@ -382,6 +428,7 @@ struct PacketBytes<'payload> {
 }
 
 impl<'payload> PacketBytes<'payload> {
+    /// Returns an error iff the packet would yield more than `usize::MAX` bytes
     pub fn new(packet: &'payload Packet) -> Result<Self, TooLongError> {
         let opcode = OpcodeBytes::new(packet.opcode());
         let payload = PayloadBytes::new(packet)?;
@@ -512,6 +559,7 @@ struct RwrqBytes<'a> {
 }
 
 impl<'a> RwrqBytes<'a> {
+    /// Returns an error iff the RWRQ payload would yield more than `usize::MAX` bytes
     pub fn new(rwrq: &'a Rwrq) -> Result<Self, TooLongError> {
         let filename = CStrBytes::from_cstr(rwrq.filename);
         let mode = CStrBytes::from_cstr(rwrq.mode);
@@ -611,6 +659,7 @@ struct DataBytes<'a> {
 }
 
 impl<'a> DataBytes<'a> {
+    /// Returns an error iff the data payload would yield more than `usize::MAX` bytes
     pub fn new(data: &'a Data) -> Result<Self, TooLongError> {
         let block_no = data.block_no.to_be_bytes().into_iter();
         let data = data.data.iter().copied();
@@ -719,6 +768,7 @@ struct ErrorBytes<'a> {
 }
 
 impl<'a> ErrorBytes<'a> {
+    /// Returns an error iff the error payload would yield more than `usize::MAX` bytes
     pub fn new(error: &'a Error) -> Result<Self, TooLongError> {
         let error_code = (error.error_code as u16).to_be_bytes().into_iter();
         let message = CStrBytes::from_cstr(error.message);
@@ -792,7 +842,7 @@ impl TryFrom<u16> for Opcode {
             Opcode::Error,
         ]
         .into_iter()
-        .find_map(|opcode| (code == opcode as u16).then_some(opcode))
+        .find(|opcode| code == *opcode as u16)
         .ok_or(UnknownOpcode(code))
     }
 }
@@ -874,6 +924,8 @@ mod parser {
     use nom::sequence::*;
     use nom::IResult;
     use nom::Parser;
+
+    pub use nom::combinator::all_consuming as eof_after;
 
     pub fn packet<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Packet<'a>> {
         let rrq = rrq_packet().map(Packet::Rrq);
