@@ -191,7 +191,7 @@ pub mod upload {
             self,
             rx: &'rx [u8],
             tx: &mut [u8; PACKET_SIZE],
-            data: impl IntoIterator<Item = u8>
+            data: impl IntoIterator<Item = u8, IntoIter: ExactSizeIterator>,
         ) -> (Result<AckReceived, TransferError<'rx>>, Option<usize>) {
             let malformed_packet = (Err(TransferError::BadPacket), None);
 
@@ -210,14 +210,24 @@ pub mod upload {
                 return (Ok(AckReceived::Retransmission(self)), None);
             }
 
-            let mut bytes = data.into_iter().take(BLOCK_SIZE);
-            if bytes.len() == 0 {
+            let data = data.into_iter().take(BLOCK_SIZE);
+            if data.len() == 0 {
                 return (Ok(AckReceived::TransferComplete), None);
             }
 
-            let written = must_write(bytes, tx, name)
+            let mut tx = tx.iter_mut();
 
-            todo!()
+            let block_no = self.block_no.wrapping_add(1);
+
+            let written =
+                must_write(OpcodeBytes::new(Opcode::Data), tx.by_ref(), "data opcode")
+                    + must_write(block_no.to_be_bytes(), tx.by_ref(), "block number")
+                    + must_write(data, tx.by_ref(), "data block");
+
+            (
+                Ok(AckReceived::NextBlock(AwaitingAck { block_no })),
+                Some(written),
+            )
         }
     }
 
@@ -261,7 +271,7 @@ pub mod upload {
     impl<'rx> Error for UploadError<'rx> {}
 }
 
-fn illegal_op<'message, 'rx, T>(
+fn illegal_op<'message, T>(
     message: &'message CStr,
     tx: &mut [u8; PACKET_SIZE],
 ) -> (Result<T, TransferError<'message>>, Option<usize>) {
@@ -854,10 +864,12 @@ impl<'a> DataBytes<'a> {
         Ok(DataBytes { block_no, data })
     }
 
+    #[allow(dead_code)]
     pub fn block_no(&mut self) -> &mut impl ExactSizeIterator<Item = u8> {
         &mut self.block_no
     }
 
+    #[allow(dead_code)]
     pub fn data(&mut self) -> &mut (impl ExactSizeIterator<Item = u8> + 'a) {
         &mut self.data
     }
@@ -889,12 +901,6 @@ struct Ack {
     block_no: u16,
 }
 
-impl Ack {
-    pub fn bytes(&self) -> AckBytes {
-        AckBytes::new(self)
-    }
-}
-
 #[derive(Debug)]
 #[derive(Clone)]
 struct AckBytes {
@@ -908,6 +914,7 @@ impl AckBytes {
         }
     }
 
+    #[allow(dead_code)]
     pub fn block_no(&mut self) -> &mut impl ExactSizeIterator<Item = u8> {
         &mut self.block_no
     }
@@ -1181,12 +1188,14 @@ mod parser {
         }
     }
 
+    #[allow(dead_code)]
     pub fn mode<'input>(
         mode: Mode,
     ) -> impl Parser<&'input [u8], Mode, nom::error::Error<&'input [u8]>> {
         value(mode, tag_no_case(mode.as_cstr().to_bytes_with_nul()))
     }
 
+    #[allow(dead_code)]
     pub fn parse_mode<'input>(
     ) -> impl Parser<&'input [u8], Mode, nom::error::Error<&'input [u8]>> {
         let netascii = mode(Mode::Netascii);
