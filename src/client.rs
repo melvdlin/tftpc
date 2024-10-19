@@ -250,30 +250,6 @@ pub mod upload {
         TransferComplete,
         Retransmission(AwaitingAck),
     }
-
-    #[derive(Debug)]
-    #[derive(Clone, Copy)]
-    #[derive(PartialEq, Eq)]
-    #[non_exhaustive]
-    pub enum UploadError<'rx> {
-        BadPacket,
-        Peer(PeerError<'rx>),
-    }
-
-    impl<'a> Display for UploadError<'a> {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            write!(
-                f,
-                "download failed: {}",
-                match self {
-                    | UploadError::BadPacket => "malformed packet",
-                    | UploadError::Peer(_) => "peer terminated connection",
-                }
-            )
-        }
-    }
-
-    impl<'rx> Error for UploadError<'rx> {}
 }
 
 fn illegal_op<'message, T>(
