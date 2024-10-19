@@ -2,3 +2,5 @@ max_width = 90
 match_arm_leading_pipes = "Always"
 merge_derives = false
 chain_width = 90
+imports_granularity = "Item"
+group_imports = "StdExternalCrate"
