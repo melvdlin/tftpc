@@ -336,6 +336,17 @@ pub enum TransferError<'rx> {
     Peer(PeerError<'rx>),
 }
 
+impl<'rx> TransferError<'rx> {
+    pub fn strip(self) -> TransferError<'static> {
+        match self {
+            | TransferError::BadPacket => TransferError::BadPacket,
+            | TransferError::Peer(peer_error) => {
+                TransferError::Peer(peer_error.strip().0)
+            }
+        }
+    }
+}
+
 impl<'a> Display for TransferError<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
@@ -362,6 +373,14 @@ pub struct PeerError<'message> {
     pub message: &'message CStr,
 }
 
+impl<'message> PeerError<'message> {
+    /// strip out the error message to promote the `self` to `'static`.
+    pub fn strip(self) -> (PeerError<'static>, &'message CStr) {
+        let Self { code, message } = self;
+        (PeerError::from(code), message)
+    }
+}
+
 impl<'message> Display for PeerError<'message> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
@@ -382,6 +401,12 @@ impl<'message> From<ProtocolError<'message>> for PeerError<'message> {
             code: error.code,
             message: error.message,
         }
+    }
+}
+
+impl<'message> From<ErrorCode> for PeerError<'message> {
+    fn from(code: ErrorCode) -> Self {
+        Self { code, message: c"" }
     }
 }
 
