@@ -594,6 +594,8 @@ impl<'filename> Display for FilenameError<'filename> {
     }
 }
 
+impl<'filename> Error for FilenameError<'filename> {}
+
 /// The possible reasons why a filename might be illegal.
 ///
 /// Used in the [`FilenameError`] type.
