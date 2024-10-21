@@ -2,6 +2,7 @@
 
 use core::error::Error;
 use core::ffi::CStr;
+use core::fmt::Debug;
 use core::fmt::Display;
 
 use crate::parser;
@@ -14,6 +15,7 @@ use crate::Opcode;
 use crate::OpcodeBytes;
 use crate::Packet;
 use crate::ProtocolError;
+use crate::PureZipExt as _;
 use crate::Rwrq;
 use crate::RwrqBytes;
 use crate::TooLongError;
@@ -27,6 +29,12 @@ pub mod download {
 
     use super::*;
 
+    /// Writes to the provided `tx` buffer
+    /// a packet requesting a download of the file specified by `filename`,
+    /// to be transferred in the specified [`Mode`].
+    ///
+    /// Returns a state object that is able to process responses to this request packet,
+    /// and the size of the request packet on success, and a [`NewDownloadError`] otherwise.
     pub fn new<'filename>(
         tx: &mut [u8; PACKET_SIZE],
         filename: &'filename CStr,
@@ -37,6 +45,9 @@ pub mod download {
             .map_err(NewDownloadError::from)
     }
 
+    /// An [`Error`] indicating that a TFTP download request packet could not be assembled.
+    ///
+    /// Returned by [`download::new`].
     #[derive(Debug)]
     #[derive(Clone, Copy)]
     #[derive(PartialEq, Eq)]
@@ -65,6 +76,8 @@ pub mod download {
         }
     }
 
+    /// A state object able to process packets received from a TFTP server
+    /// as part of a download transfer.
     #[derive(Debug)]
     #[derive(Clone, Copy)]
     #[derive(PartialEq, Eq)]
@@ -77,12 +90,39 @@ pub mod download {
             AwaitingData { block_no: 1 }
         }
 
+        /// Process the packet in the `rx` buffer received from a TFTP server
+        /// as part of a download transfer
+        /// and potentially write an appropriate response into the provided `tx` buffer.
+        ///
+        ///
+        /// Returns the size of the response packet, if one should be sent,
+        /// and the status of the transfer.
+        ///
+        ///
+        /// A [`TransferError`] indicates that the download failed, and why.
+        ///
+        ///
+        /// A [`BlockReceived`] indicates that the download is either still in progress,
+        /// or successfully finished:
+        ///
+        /// - [`Intermediate`](BlockReceived::Intermediate)
+        ///   indicates that a block of data has been received,
+        ///   but more are expected still.
+        ///
+        /// - [`Final`](BlockReceived::Final)
+        ///   indicates that the final block of data has been received
+        ///   and the download is finished.
+        ///
+        /// - [`Retransmission`](BlockReceived::Retransmission)
+        ///   indicates that a block of data has been received,
+        ///   but did not match the expected block number
+        ///   and is thus discarded as a retransmission.
         pub fn process<'rx>(
             self,
             rx: &'rx [u8],
             tx: &mut [u8; PACKET_SIZE],
         ) -> (
-            Result<BlockRecieved<'rx>, TransferError<'rx>>,
+            Result<BlockReceived<'rx>, TransferError<'rx>>,
             Option<usize>,
         ) {
             let malformed_packet = (Err(TransferError::BadPacket), None);
@@ -103,20 +143,20 @@ pub mod download {
 
             if block_no != self.block_no {
                 // we ignore both smaller and greater block numbers to support wrapping
-                return (Ok(BlockRecieved::Retransmission(self)), None);
+                return (Ok(BlockReceived::Retransmission(self)), None);
             }
 
             let written =
                 must_write(Packet::Ack(Ack { block_no }).bytes().unwrap(), tx, "ack");
             let received = if let Ok(intermediate) = <&[u8; BLOCK_SIZE]>::try_from(data) {
-                BlockRecieved::Intermediate(
+                BlockReceived::Intermediate(
                     AwaitingData {
                         block_no: block_no.wrapping_add(1),
                     },
                     intermediate,
                 )
             } else {
-                BlockRecieved::Final(data)
+                BlockReceived::Final(data)
             };
 
             (Ok(received), Some(written))
@@ -131,10 +171,21 @@ pub mod download {
     // full data block   -> data available,              send ack
     // small data block  -> transfer complete,           send ack
 
+    /// The result of processing a packet received from a TFTP server
+    /// as part of a download transfer.
+    ///
+    /// See [`AwaitingData::process`] for details.
     #[derive(Debug)]
-    pub enum BlockRecieved<'rx> {
+    pub enum BlockReceived<'rx> {
+        /// Indicates that a block of data has been received,
+        /// but more are expected still.
         Intermediate(AwaitingData, &'rx [u8; BLOCK_SIZE]),
+        /// indicates that the final block of data has been received,
+        /// and the download is finished.
         Final(&'rx [u8]),
+        /// indicates that a block of data has been received,
+        /// but did not match the expected block number
+        /// and is thus discarded as a retransmission.
         Retransmission(AwaitingData),
     }
 }
@@ -352,21 +403,26 @@ fn write_rwrq<'filename>(
     })?;
     debug_assert!(is_netascii(rwrq_bytes.mode().clone()));
 
-    let mut tx_bytes = tx.iter_mut();
+    let mut tx_bytes = tx.iter_mut().peekable();
     let mut opcode_bytes = OpcodeBytes::new(opcode);
-    must_write(opcode_bytes.by_ref(), tx_bytes.by_ref(), "rrq opcode");
+    must_write(opcode_bytes.by_ref(), tx_bytes.by_ref(), "rwrq opcode");
 
-    debug_assert_eq!(rwrq_bytes.filename().len(), filename.to_bytes().len());
-    for (buf, byte) in tx_bytes.by_ref().zip(rwrq_bytes.by_ref()) {
+    debug_assert_eq!(
+        rwrq_bytes.filename().len(),
+        filename.to_bytes_with_nul().len()
+    );
+    for (buf, byte) in tx_bytes.by_ref().pure_zip(rwrq_bytes.by_ref()) {
         *buf = byte;
     }
 
     if rwrq_bytes.len() > 0 {
-        let filename_len = filename.count_bytes();
+        // rwrq_bytes has not been fully consumed
+
+        let filename_len = filename.to_bytes_with_nul().len();
         // the packet should be significantly larger
         // than the opcode and the mode combined
         debug_assert!(
-            filename_len > 0,
+            filename_len > 1,
             "cannot fit filename null terminator into packet; this is a bug"
         );
 
@@ -405,13 +461,17 @@ fn must_write<'tx>(
     let mut bytes = bytes.into_iter();
     let mut tx_bytes = tx.into_iter();
     let tx_len = tx_bytes.len();
-    for (buf, byte) in tx_bytes.by_ref().zip(bytes.by_ref()) {
+    let mut counted = 0;
+
+    for (byte, buf) in bytes.by_ref().pure_zip(tx_bytes.by_ref()) {
         *buf = byte;
+        counted += 1;
     }
     assert_eq!(bytes.len(), 0, "cannot fit `{name}` into TX buffer");
 
     let unwritten = tx_bytes.len();
     let written = tx_len - unwritten;
+    debug_assert_eq!(counted, written);
     written
 }
 

@@ -1,13 +1,14 @@
 //! # The Tremendously Trivial File Transfer Protocol
 //!
-//! This crate provides a sans-io, no-std, no-alloc TFTP implementation
+//! A sans-io, no-std, no-alloc TFTP implementation
 //! as according to [RFC 1350](https://datatracker.ietf.org/doc/html/rfc1350).
 //!
-//! Currently, this crate implements only client and does not support options.
+//! Currently, this crate implements only a client and does not support options.
 
 #![no_std]
 #![allow(clippy::let_and_return)]
-#![forbid(unsafe_code, unused_must_use)]
+#![forbid(unused_must_use)]
+#![forbid(unsafe_code)]
 
 pub mod client;
 
@@ -26,6 +27,50 @@ const BLOCK_NO_SIZE: usize = size_of::<u16>();
 
 /// The size of a payload data block.
 pub const BLOCK_SIZE: usize = 512;
+
+macro_rules! concat_arrays {
+    ($default:expr, $t:ty; $($a:expr),* $(,)?) => {
+        {
+            const TOTAL_LEN: usize = 0 $(+ $a.len())*;
+            let mut arr = [$default; TOTAL_LEN];
+            let mut i = 0;
+            while i < TOTAL_LEN {
+                let mut relative_i = i;
+                $(
+                    if relative_i < $a.len() {
+                        arr[i] = $a[relative_i];
+                        i += 1;
+                        continue;
+                    } else {
+                        relative_i -= $a.len();
+                    }
+                )*
+                let _ = relative_i;
+                panic!("index out of range!");
+            }
+            arr
+        }
+    };
+}
+
+macro_rules! infer_array_size {
+    ($(#[$attrs:meta])* $vis:vis $bind:ident $ident:ident: [$t:ty; _] = $val:expr $(;)?) => {
+        $(#[$attrs])*
+        $vis $bind $ident: [$t; $val.len()] = $val;
+    };
+}
+
+infer_array_size! {
+    /// The response to a packet with an unknown transfer ID.
+    ///
+    /// As with any error packet, sending this is pure courtesy.
+    pub const UNKNOWN_TID_PACKET: [u8; _] = concat_arrays! {
+        0, u8;
+        (Opcode::Error as u16).to_be_bytes(),
+        (ErrorCode::UnknownTransferID as u16).to_be_bytes(),
+        b"\0",
+    };
+}
 
 /// A TFTP error code.
 #[derive(Debug)]
@@ -301,10 +346,12 @@ impl<'a> RwrqBytes<'a> {
         Ok(Self { filename, mode })
     }
 
+    /// Includes nul terminator.
     pub fn filename(&mut self) -> &mut (impl ExactSizeIterator<Item = u8> + Clone + 'a) {
         &mut self.filename
     }
 
+    /// Includes nul terminator.
     pub fn mode(&mut self) -> &mut (impl ExactSizeIterator<Item = u8> + Clone + 'a) {
         &mut self.mode
     }
@@ -329,18 +376,17 @@ impl<'a> ExactSizeIterator for RwrqBytes<'a> {
     }
 }
 
+/// Includes nul terminator.
 #[derive(Debug)]
 #[derive(Clone)]
-struct CStrBytes<'str> {
-    cstr: &'str [u8],
-    next: Option<usize>,
+struct CStrBytes<'cstr> {
+    inner: core::iter::Copied<IntoIter<&'cstr [u8]>>,
 }
 
 impl<'str> CStrBytes<'str> {
     pub fn from_cstr(cstr: &'str CStr) -> Self {
         Self {
-            cstr: cstr.to_bytes(),
-            next: Some(0),
+            inner: cstr.to_bytes_with_nul().iter().copied(),
         }
     }
 }
@@ -349,26 +395,15 @@ impl<'str> Iterator for CStrBytes<'str> {
     type Item = u8;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next = self.next?;
-        let next_byte = self.cstr.get(next).copied();
-        if next_byte.is_some() {
-            self.next = next.checked_add(1);
-        }
-        next_byte
+        self.inner.next()
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.len();
-        (len, Some(len))
+        self.inner.size_hint()
     }
 }
 
-impl<'str> ExactSizeIterator for CStrBytes<'str> {
-    fn len(&self) -> usize {
-        let Some(next) = self.next else { return 0 };
-        self.cstr.len() - next
-    }
-}
+impl<'cstr> ExactSizeIterator for CStrBytes<'cstr> {}
 
 #[derive(Debug)]
 #[derive(Clone, Copy)]
@@ -486,14 +521,14 @@ struct ProtocolError<'a> {
 
 #[derive(Debug)]
 #[derive(Clone)]
-struct ErrorBytes<'a> {
+struct ErrorBytes<'message> {
     error_code: IntoIter<[u8; 2]>,
-    message: CStrBytes<'a>,
+    message: CStrBytes<'message>,
 }
 
-impl<'a> ErrorBytes<'a> {
+impl<'message> ErrorBytes<'message> {
     /// Returns an error iff the error payload would yield more than `usize::MAX` bytes
-    pub fn new(error: &'a ProtocolError) -> Result<Self, TooLongError> {
+    pub fn new(error: &'message ProtocolError) -> Result<Self, TooLongError> {
         let error_code = (error.code as u16).to_be_bytes().into_iter();
         let message = CStrBytes::from_cstr(error.message);
 
@@ -508,6 +543,16 @@ impl<'a> ErrorBytes<'a> {
             error_code,
             message,
         })
+    }
+
+    #[allow(dead_code)]
+    pub fn error_code(&mut self) -> &mut impl ExactSizeIterator<Item = u8> {
+        &mut self.error_code
+    }
+
+    #[allow(dead_code)]
+    pub fn message(&mut self) -> &mut (impl ExactSizeIterator<Item = u8> + 'message) {
+        &mut self.message
     }
 }
 
@@ -746,18 +791,19 @@ mod parser {
         nom::error::Error<&'input [u8]>,
     > {
         use nom::FindSubstring;
-        use nom::InputTake;
 
-        move |i: &[u8]| {
+        fn f(i: &[u8]) -> IResult<&[u8], &CStr, nom::error::Error<&[u8]>> {
             let Some(nul_pos) = i.find_substring(b"\0".as_slice()) else {
                 return Err(nom::Err::Incomplete(nom::Needed::Unknown));
             };
 
-            let (cstr, rest) = i.take_split(nul_pos + 1);
+            let (cstr, rest) = i.split_at(nul_pos + 1);
             let cstr = CStr::from_bytes_with_nul(cstr)
                 .expect("only nul byte should be at index + 1");
             Ok((rest, cstr))
         }
+
+        f
     }
 
     #[allow(dead_code)]
@@ -796,8 +842,81 @@ trait DisplayExt {
     fn display(&self) -> impl Display;
 }
 
-impl DisplayExt for &CStr {
+impl DisplayExt for CStr {
     fn display(&self) -> impl Display {
         DisplayCStr(self)
+    }
+}
+
+/// Like [`core::iter::zip`], but only works with [`core::iter::ExactSizeIterator`]
+/// as underlying iterators.
+/// This requirement exists so that [`PureZip`]
+/// can advance the underlying iterators only when both will yield an item.
+fn pure_zip<A, B>(left: A, right: B) -> PureZip<A::IntoIter, B::IntoIter>
+where
+    A: IntoIterator<IntoIter: ExactSizeIterator>,
+    B: IntoIterator<IntoIter: ExactSizeIterator>,
+{
+    PureZip {
+        left: left.into_iter(),
+        right: right.into_iter(),
+    }
+}
+
+/// See [`pure_zip`].
+#[derive(Debug)]
+struct PureZip<A, B> {
+    left: A,
+    right: B,
+}
+
+impl<A, B> Iterator for PureZip<A, B>
+where
+    A: ExactSizeIterator,
+    B: ExactSizeIterator,
+{
+    type Item = (<A as Iterator>::Item, <B as Iterator>::Item);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.left.len() > 0 && self.right.len() > 0 {
+            Some((self.left.next().unwrap(), self.right.next().unwrap()))
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len(), Some(self.len()))
+    }
+}
+
+impl<A, B> ExactSizeIterator for PureZip<A, B>
+where
+    A: ExactSizeIterator,
+    B: ExactSizeIterator,
+{
+    fn len(&self) -> usize {
+        let left = self.left.len();
+        let right = self.right.len();
+
+        core::cmp::min(left, right)
+    }
+}
+
+impl<A, B> core::iter::FusedIterator for PureZip<A, B>
+where
+    A: ExactSizeIterator,
+    B: ExactSizeIterator,
+{
+}
+
+trait PureZipExt: Sized {
+    fn pure_zip<B: ExactSizeIterator>(self, other: B) -> PureZip<Self, B>;
+}
+
+impl<I: ExactSizeIterator> PureZipExt for I {
+    /// See [`pure_zip`].
+    fn pure_zip<B: ExactSizeIterator>(self, other: B) -> PureZip<I, B> {
+        pure_zip(self, other)
     }
 }
