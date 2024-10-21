@@ -34,46 +34,14 @@ pub mod download {
     /// to be transferred in the specified [`Mode`].
     ///
     /// Returns a state object that is able to process responses to this request packet,
-    /// and the size of the request packet on success, and a [`NewDownloadError`] otherwise.
+    /// and the size of the request packet on success, and a [`FilenameError`] otherwise.
     pub fn new<'filename>(
         tx: &mut [u8; PACKET_SIZE],
         filename: &'filename CStr,
         mode: Mode,
-    ) -> Result<(AwaitingData, usize), NewDownloadError<'filename>> {
+    ) -> Result<(AwaitingData, usize), FilenameError<'filename>> {
         write_rwrq(Opcode::Rrq, tx, filename, mode)
             .map(|written| (AwaitingData::new(), written))
-            .map_err(NewDownloadError::from)
-    }
-
-    /// An [`Error`] indicating that a TFTP download request packet could not be assembled.
-    ///
-    /// Returned by [`download::new`].
-    #[derive(Debug)]
-    #[derive(Clone, Copy)]
-    #[derive(PartialEq, Eq)]
-    #[non_exhaustive]
-    pub enum NewDownloadError<'a> {
-        Filename(FilenameError<'a>),
-    }
-
-    impl<'a> Display for NewDownloadError<'a> {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            write!(
-                f,
-                "download initiation failed; cause: {}",
-                match self {
-                    | NewDownloadError::Filename(_) => "filename",
-                }
-            )
-        }
-    }
-
-    impl<'a> Error for NewDownloadError<'a> {}
-
-    impl<'filename> From<FilenameError<'filename>> for NewDownloadError<'filename> {
-        fn from(filename: FilenameError<'filename>) -> Self {
-            NewDownloadError::Filename(filename)
-        }
     }
 
     /// A state object able to process packets received from a TFTP server
@@ -195,42 +163,23 @@ pub mod upload {
 
     use super::*;
 
+    /// Writes to the provided `tx` buffer
+    /// a packet requesting an upwnload of the file specified by `filename`,
+    /// to be transferred in the specified [`Mode`].
+    ///
+    /// Returns a state object that is able to process responses to this request packet,
+    /// and the size of the request packet on success, and a [`FilenameError`] otherwise.
     pub fn new<'filename>(
         tx: &mut [u8; PACKET_SIZE],
         filename: &'filename CStr,
         mode: Mode,
-    ) -> Result<(AwaitingAck, usize), NewUploadError<'filename>> {
+    ) -> Result<(AwaitingAck, usize), FilenameError<'filename>> {
         write_rwrq(Opcode::Wrq, tx, filename, mode)
             .map(|written| (AwaitingAck::new(), written))
-            .map_err(NewUploadError::from)
     }
 
-    #[derive(Debug)]
-    #[non_exhaustive]
-    pub enum NewUploadError<'a> {
-        Filename(FilenameError<'a>),
-    }
-
-    impl<'a> Display for NewUploadError<'a> {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            write!(
-                f,
-                "download initiation failed; cause: {}",
-                match self {
-                    | NewUploadError::Filename(_) => "filename",
-                }
-            )
-        }
-    }
-
-    impl<'a> Error for NewUploadError<'a> {}
-
-    impl<'filename> From<FilenameError<'filename>> for NewUploadError<'filename> {
-        fn from(filename: FilenameError<'filename>) -> Self {
-            NewUploadError::Filename(filename)
-        }
-    }
-
+    /// A state object able to process packets received from a TFTP server
+    /// as part of an upload transfer.
     #[derive(Debug)]
     #[derive(Clone, Copy)]
     #[derive(PartialEq, Eq)]
@@ -243,6 +192,39 @@ pub mod upload {
             AwaitingAck { block_no: 0 }
         }
 
+        /// Process the packet in the `rx` buffer received from a TFTP server
+        /// as part of an upwnload transfer
+        /// and potentially write an appropriate response into the provided `tx` buffer.
+        ///
+        /// Takes a `data` iterator of the remaining data to be uploaded.
+        /// This iterator should usually be passed by `&mut`,
+        /// as this will advance the underlying iterator
+        /// when data is taken out of it and written into the `tx` buffer.
+        ///
+        ///
+        ///
+        /// Returns the size of the response packet, if one should be sent,
+        /// and the status of the transfer.
+        ///
+        ///
+        /// A [`TransferError`] indicates that the upload failed, and why.
+        ///
+        ///
+        /// An [`AckReceived`] indicates that the download is either still in progress,
+        /// or successfully finished:
+        ///
+        /// - [`Intermediate`](AckReceived::NextBlock)
+        ///   indicates that the last sent packet has been acknowledged,
+        ///   and the next data packet should be sent.
+        ///
+        /// - [`TransferComplete`](AckReceived::TransferComplete)
+        ///   indicates that the last sent packet has been acknowledged,
+        ///   and the transfer is complete.
+        ///
+        /// - [`Retransmission`](AckReceived::Retransmission)
+        ///   indicates that some  has been acknowledged,
+        ///   but not the last sent one.
+        ///   The acknowledgement is thus discarded as a retransmission.
         pub fn process<'rx>(
             self,
             rx: &'rx [u8],
@@ -295,6 +277,10 @@ pub mod upload {
     // correct block number, data available -> send next block                         => NextBlock
     // correct block number, no more data   -> transfer complete                       => TransferComplete
 
+    /// The result of processing a packet received from a TFTP server
+    /// as part of an upload transfer.
+    ///
+    /// See [`AwaitingAck::process`] for details.
     #[derive(Debug)]
     pub enum AckReceived {
         NextBlock(AwaitingAck),
