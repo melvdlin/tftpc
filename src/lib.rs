@@ -162,7 +162,7 @@ impl<'buf> Packet<'buf> {
             | Packet::Rrq(_) => Opcode::Rrq,
             | Packet::Wrq(_) => Opcode::Wrq,
             | Packet::Data(_) => Opcode::Data,
-            | Packet::Ack(_) => Opcode::Data,
+            | Packet::Ack(_) => Opcode::Ack,
             | Packet::Error(_) => Opcode::Error,
         }
     }
