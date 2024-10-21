@@ -25,6 +25,55 @@ use crate::PACKET_SIZE;
 use nom::Parser as _;
 
 /// The TFTP client file download implementation.
+///
+/// # Examples
+///
+/// A simple `std`-dependent event loop to drive a download transaction:
+/// ```no_run
+/// use ttftp::client::download::*;
+/// use ttftp::client::download;
+/// use ttftp::Mode;
+///
+/// fn download(
+///     filename: &CStr,
+///     sock: UdpSocket,
+///     tx: &mut [u8; ttftp::PACKET_SIZE],
+///     rx: &mut [u8; ttftp::PACKET_SIZE],
+/// ) -> Result<Vec<u8>, Box<dyn Error>> {
+///     let mut file = Vec::<u8>::new();
+///
+///     let mut state;
+///     let send;
+///     (state, send) = download::new(tx, &filename, Mode::Octect).unwrap();
+///
+///     loop {
+///         sock.send(&tx[..send])?;
+///         let received = sock.recv(rx)?;
+///
+///         let (result, send) = state.process(&rx[..received], tx);
+///
+///         if let Some(send) = send {
+///             sock.send(&tx[..send])?;
+///         }
+///
+///         // strip out error message to promote the error to 'static
+///         // this would not be required with polonius
+///         state = match result.map_err(TransferError::strip)? {
+///             | BlockReceived::Intermediate(awaiting_data, block) => {
+///                 file.extend_from_slice(block);
+///                 awaiting_data
+///             }
+///             | BlockReceived::Final(block) => {
+///                 file.extend_from_slice(block);
+///                 break;
+///             }
+///             | BlockReceived::Retransmission(state) => state,
+///         }
+///     }
+///
+///     Ok(file)
+/// }
+/// ```
 pub mod download {
 
     use super::*;
@@ -158,7 +207,49 @@ pub mod download {
     }
 }
 
-/// The TFTP client file upload implementation.
+/// # Examples
+///
+/// A simple `std`-dependent event loop to drive a download transaction:
+/// ```no_run
+/// use tftp::client::upload::*;
+/// use tftp::client::upload;
+/// use tftp::Mode;
+///
+/// fn upload<'filename>(
+///     filename: &'filename CStr,
+///     file: &[u8],
+///     sock: UdpSocket,
+///     tx: &mut [u8; ttftp::PACKET_SIZE],
+///     rx: &mut [u8; ttftp::PACKET_SIZE],
+/// ) -> Result<(), Box<dyn Error + 'filename>> where {
+///     let mut state;
+///     let send;
+///     (state, send) = upload::new(tx, filename, Mode::Octect)?;
+///
+///     let mut data = file.iter().copied();
+///     loop {
+///         sock.send(&tx[..send])?;
+///         let received = sock.recv(rx)?;
+///
+///         let (result, send) = state.process(&rx[..received], tx, data.by_ref());
+///
+///         if let Some(send) = send {
+///             sock.send(&tx[..send])?;
+///         }
+///
+///         state = match result.map_err(TransferError::strip)? {
+///             | AckReceived::NextBlock(awaiting_ack) => awaiting_ack,
+///             | AckReceived::TransferComplete => break,
+///             | AckReceived::Retransmission(awaiting_ack) => {
+///                 awaiting_ack
+///             }
+///         }
+///     }
+///
+///     Ok(())
+/// }
+///
+/// ```
 pub mod upload {
 
     use super::*;
