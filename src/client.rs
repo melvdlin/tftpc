@@ -28,10 +28,15 @@ use nom::Parser as _;
 ///
 /// # Examples
 ///
-/// A simple `std`-dependent event loop to drive a download transaction:
+/// A simple event loop to drive a download transaction:
 /// ```no_run
+/// use core::error::Error;
+/// use core::ffi::CStr;
+/// use std::net::UdpSocket;
+///
 /// use ttftp::client::download::*;
 /// use ttftp::client::download;
+/// use ttftp::client::TransferError;
 /// use ttftp::Mode;
 ///
 /// fn download(
@@ -207,13 +212,20 @@ pub mod download {
     }
 }
 
+/// The TFTP client file upload implementation.
+///
 /// # Examples
 ///
-/// A simple `std`-dependent event loop to drive a download transaction:
+/// A simple event loop to drive a upload transaction:
 /// ```no_run
-/// use tftp::client::upload::*;
-/// use tftp::client::upload;
-/// use tftp::Mode;
+/// use core::error::Error;
+/// use core::ffi::CStr;
+/// use std::net::UdpSocket;
+///
+/// use ttftp::client::upload::*;
+/// use ttftp::client::upload;
+/// use ttftp::client::TransferError;
+/// use ttftp::Mode;
 ///
 /// fn upload<'filename>(
 ///     filename: &'filename CStr,

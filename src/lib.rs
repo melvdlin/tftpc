@@ -1,4 +1,4 @@
-//! # The Tremendously Trivial File Transfer Protocol
+//! # a (Tremendously) Trivial File Transfer Protocol implementation
 //!
 //! A sans-io, no-std, no-alloc TFTP implementation
 //! as according to [RFC 1350](https://datatracker.ietf.org/doc/html/rfc1350).
@@ -820,6 +820,112 @@ mod parser {
         let octet = mode(Mode::Octect);
 
         alt((netascii, octet))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        const LOREM: &str = include_str!("lorem.txt");
+
+        #[test]
+        fn test_packet() {
+            let mut buf = [0u8; PACKET_SIZE];
+
+            {
+                let rrq = Packet::Rrq(Rwrq {
+                    filename: c"foobar.txt",
+                    mode: c"octet",
+                });
+
+                let mut rrq_bytes = rrq.bytes().unwrap();
+                let rrq_len = rrq_bytes.len();
+                buf.fill_with(|| rrq_bytes.next().unwrap_or(0));
+
+                assert_eq!(packet().parse(&buf), Ok((&buf[rrq_len..], rrq)));
+                assert!(matches!(
+                    packet().parse(&buf[..rrq_len - 1]),
+                    Err(nom::Err::Incomplete(_))
+                ));
+            }
+
+            {
+                let wrq = Packet::Rrq(Rwrq {
+                    filename: c"foobar.txt",
+                    mode: c"octet",
+                });
+
+                let mut wrq_bytes = wrq.bytes().unwrap();
+                let wrq_len = wrq_bytes.len();
+                buf.fill_with(|| wrq_bytes.next().unwrap_or(0));
+
+                assert_eq!(packet().parse(&buf), Ok((&buf[wrq_len..], wrq)));
+                assert!(matches!(
+                    packet().parse(&buf[..wrq_len - 1]),
+                    Err(nom::Err::Incomplete(_))
+                ))
+            }
+
+            {
+                let data = Packet::Data(Data {
+                    block_no: 54321,
+                    data: &LOREM.as_bytes()[..BLOCK_SIZE],
+                });
+
+                let mut data_bytes = data.bytes().unwrap();
+                let data_len = data_bytes.len();
+                buf.fill_with(|| data_bytes.next().unwrap_or(0));
+
+                assert_eq!(packet().parse(&buf), Ok((&buf[data_len..], data)));
+                assert!(packet().parse(&buf[..data_len - 1]).is_ok())
+            }
+
+            {
+                let ack = Packet::Ack(Ack { block_no: 12345 });
+
+                let mut ack_bytes = ack.bytes().unwrap();
+                let ack_len = ack_bytes.len();
+                buf.fill_with(|| ack_bytes.next().unwrap_or(0));
+
+                assert_eq!(packet().parse(&buf), Ok((&buf[ack_len..], ack)));
+                assert!(matches!(
+                    packet().parse(&buf[..ack_len - 1]),
+                    Err(nom::Err::Incomplete(_))
+                ))
+            }
+
+            {
+                let error = Packet::Error(ProtocolError {
+                    code: ErrorCode::FileNotFound,
+                    message: c"foobar",
+                });
+
+                let mut error_bytes = error.bytes().unwrap();
+                let error_len = error_bytes.len();
+                buf.fill_with(|| error_bytes.next().unwrap_or(0));
+
+                assert_eq!(packet().parse(&buf), Ok((&buf[error_len..], error)));
+                assert!(matches!(
+                    packet().parse(&buf[..error_len - 1]),
+                    Err(nom::Err::Incomplete(_))
+                ));
+            }
+        }
+
+        #[test]
+        fn test_bad_opcode() {
+            let mut buf = [0_u8; PACKET_SIZE];
+
+            let rrq = Packet::Rrq(Rwrq {
+                filename: c"foobar.txt",
+                mode: c"octet",
+            });
+
+            let mut rrq_bytes = rrq.bytes().unwrap();
+            buf.fill_with(|| rrq_bytes.next().unwrap_or(0));
+            *<&mut [u8; 2]>::try_from(&mut buf[..2]).unwrap() = 0x34_u16.to_be_bytes();
+
+            assert!(matches!(packet().parse(&buf), Err(nom::Err::Error(_))));
+        }
     }
 }
 
