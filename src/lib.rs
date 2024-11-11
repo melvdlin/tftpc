@@ -7,7 +7,7 @@
 
 #![no_std]
 #![allow(clippy::let_and_return)]
-#![forbid(unused_must_use)]
+#![deny(unused_must_use)]
 #![forbid(unsafe_code)]
 
 pub mod client;
@@ -29,7 +29,7 @@ const BLOCK_NO_SIZE: usize = size_of::<u16>();
 pub const BLOCK_SIZE: usize = 512;
 
 macro_rules! concat_arrays {
-    ($default:expr, $t:ty; $($a:expr),* $(,)?) => {
+    ([$default:expr; $t:ty] $($a:expr),* $(,)?) => {
         {
             const TOTAL_LEN: usize = 0 $(+ $a.len())*;
             let mut arr = [$default; TOTAL_LEN];
@@ -65,11 +65,32 @@ infer_array_size! {
     ///
     /// As with any error packet, sending this is pure courtesy.
     pub const UNKNOWN_TID_PACKET: [u8; _] = concat_arrays! {
-        0, u8;
+        [0; u8]
         (Opcode::Error as u16).to_be_bytes(),
         (ErrorCode::UnknownTransferID as u16).to_be_bytes(),
         b"\0",
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{PACKET_SIZE, UNKNOWN_TID_PACKET};
+
+    #[test]
+    fn test_unknown_tid_packet() {
+        assert!(UNKNOWN_TID_PACKET.len() <= PACKET_SIZE);
+
+        let (opcode, rest) = UNKNOWN_TID_PACKET.split_at(size_of::<u16>());
+        assert_eq!(opcode, &5u16.to_be_bytes());
+
+        let (error_code, rest) = rest.split_at(size_of::<u16>());
+        assert_eq!(error_code, &5u16.to_be_bytes());
+
+        let error_message = netascii::Bytes::from_netascii(rest.iter().copied());
+        assert!(error_message.clone().all(|result| result.is_ok()));
+        assert!(error_message.clone().filter(|char| *char == Ok(b'\0')).count() == 1);
+        assert_eq!(error_message.clone().last(), Some(Ok(b'\0')));
+    }
 }
 
 /// A TFTP error code.
@@ -326,21 +347,27 @@ struct Rwrq<'a> {
 #[derive(Debug)]
 #[derive(Clone)]
 struct RwrqBytes<'a> {
-    filename: CStrBytes<'a>,
+    filename: CountedLen<netascii::Netascii<CStrBytes<'a>>>,
     mode: CStrBytes<'a>,
 }
 
 impl<'a> RwrqBytes<'a> {
     /// Returns an error iff the RWRQ payload would yield more than `usize::MAX` bytes
     pub fn new(rwrq: &'a Rwrq) -> Result<Self, TooLongError> {
-        let filename = CStrBytes::from_cstr(rwrq.filename);
+        let too_long = TooLongError {
+            actual_len: None,
+            max_len: usize::MAX,
+        };
+
+        let Some(filename) = counted_len(netascii::Netascii::from_bytes(
+            CStrBytes::from_cstr(rwrq.filename),
+        )) else {
+            return Err(too_long);
+        };
         let mode = CStrBytes::from_cstr(rwrq.mode);
 
         if filename.len().checked_add(mode.len()).is_none() {
-            return Err(TooLongError {
-                actual_len: None,
-                max_len: usize::MAX,
-            });
+            return Err(too_long);
         }
 
         Ok(Self { filename, mode })
@@ -971,6 +998,7 @@ where
 
 /// See [`pure_zip`].
 #[derive(Debug)]
+#[derive(Clone, Copy)]
 struct PureZip<A, B> {
     left: A,
     right: B,
@@ -1024,5 +1052,48 @@ impl<I: ExactSizeIterator> PureZipExt for I {
     /// See [`pure_zip`].
     fn pure_zip<B: ExactSizeIterator>(self, other: B) -> PureZip<I, B> {
         pure_zip(self, other)
+    }
+}
+
+/// Constructs an [`ExactSizeIterator`] from a given [`Iterator`]
+/// by simply counting all elements it yields.
+///
+/// Fails if [`iter.size_hint()`] does not return an upper bound.
+fn counted_len<I: Iterator + Clone>(iter: I) -> Option<CountedLen<I>> {
+    iter.size_hint().1?;
+    let iter = iter.fuse();
+
+    let count = iter.clone().count();
+    Some(CountedLen {
+        inner: iter,
+        remaining: count,
+    })
+}
+
+/// See [`counted_len`].
+#[derive(Debug)]
+#[derive(Clone)]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+struct CountedLen<I> {
+    inner: core::iter::Fuse<I>,
+    remaining: usize,
+}
+
+impl<I: Iterator> Iterator for CountedLen<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().inspect(|_| self.remaining -= 1)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl<I: Iterator> ExactSizeIterator for CountedLen<I> {
+    fn len(&self) -> usize {
+        self.remaining
     }
 }

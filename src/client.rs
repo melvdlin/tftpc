@@ -89,6 +89,11 @@ pub mod download {
     ///
     /// Returns a state object that is able to process responses to this request packet,
     /// and the size of the request packet on success, and a [`FilenameError`] otherwise.
+    ///
+    /// Note that the filename is encoded into Netascii, and any filename length related errors
+    /// refer to its encoded length.
+    /// Users generally need not concern themselves with this encoding,
+    /// since it only matters if the filename contains carriage return (CR) characters.
     pub fn new<'filename>(
         tx: &mut [u8; PACKET_SIZE],
         filename: &'filename CStr,
@@ -210,6 +215,63 @@ pub mod download {
         /// and is thus discarded as a retransmission.
         Retransmission(AwaitingData),
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_new_octet() {
+            let filename = c"foo_bar.txt";
+            let mut buf = [0u8; PACKET_SIZE];
+
+            let result = download::new(&mut buf, filename, Mode::Octect).unwrap();
+            assert!(matches!(result, (AwaitingData { block_no: 1 }, _)));
+
+            let (opcode, rest) = buf[..result.1].split_at(size_of::<u16>());
+            assert_eq!(opcode, 1u16.to_be_bytes());
+            let (filename_bytes, mode) =
+                rest.split_at(rest.iter().position(|char| *char == b'\0').unwrap() + 1);
+            assert!(filename_bytes.eq_ignore_ascii_case(filename.to_bytes_with_nul()));
+            assert!(mode.eq_ignore_ascii_case(c"octet".to_bytes_with_nul()))
+        }
+
+        #[test]
+        fn test_new_netscii() {
+            let filename = c"foo_bar.txt";
+            let mut buf = [0u8; PACKET_SIZE];
+
+            let result = download::new(&mut buf, filename, Mode::Netascii).unwrap();
+            assert!(matches!(result, (AwaitingData { block_no: 1 }, _)));
+
+            let (opcode, rest) = buf[..result.1].split_at(size_of::<u16>());
+            assert_eq!(opcode, 1u16.to_be_bytes());
+            let (filename_bytes, mode) =
+                rest.split_at(rest.iter().position(|char| *char == b'\0').unwrap() + 1);
+            assert!(filename_bytes.eq_ignore_ascii_case(filename.to_bytes_with_nul()));
+            assert!(mode.eq_ignore_ascii_case(c"netascii".to_bytes_with_nul()))
+        }
+
+        #[test]
+        fn test_new_long_filename() {
+            let filename = &const {
+                let mut filename = [b'a'; PACKET_SIZE];
+                filename[PACKET_SIZE - 1] = b'\0';
+                filename
+            };
+            let filename = CStr::from_bytes_with_nul(filename).unwrap();
+
+            let mut buf = [0u8; PACKET_SIZE];
+            let result = download::new(&mut buf, filename, Mode::Octect);
+            assert!(matches!(
+                result,
+                Err(FilenameError {
+                    kind: FilenameErrorKind::TooLong(_),
+                    ..
+                })
+            ))
+        }
+    }
 }
 
 /// The TFTP client file upload implementation.
@@ -272,6 +334,11 @@ pub mod upload {
     ///
     /// Returns a state object that is able to process responses to this request packet,
     /// and the size of the request packet on success, and a [`FilenameError`] otherwise.
+    ///
+    /// Note that the filename is encoded into Netascii, and any filename length related errors
+    /// refer to its encoded length.
+    /// Users generally need not concern themselves with this encoding,
+    /// since it only matters if the filename contains carriage return (CR) characters.
     pub fn new<'filename>(
         tx: &mut [u8; PACKET_SIZE],
         filename: &'filename CStr,
@@ -516,15 +583,13 @@ fn write_rwrq<'filename>(
         kind: e.into(),
     })?;
     debug_assert!(is_netascii(rwrq_bytes.mode().clone()));
+    debug_assert!(is_netascii(rwrq_bytes.filename().clone()));
+    let filename_len = rwrq_bytes.filename().len();
 
     let mut tx_bytes = tx.iter_mut().peekable();
     let mut opcode_bytes = OpcodeBytes::new(opcode);
     must_write(opcode_bytes.by_ref(), tx_bytes.by_ref(), "rwrq opcode");
 
-    debug_assert_eq!(
-        rwrq_bytes.filename().len(),
-        filename.to_bytes_with_nul().len()
-    );
     for (buf, byte) in tx_bytes.by_ref().pure_zip(rwrq_bytes.by_ref()) {
         *buf = byte;
     }
@@ -532,7 +597,6 @@ fn write_rwrq<'filename>(
     if rwrq_bytes.len() > 0 {
         // rwrq_bytes has not been fully consumed
 
-        let filename_len = filename.to_bytes_with_nul().len();
         // the packet should be significantly larger
         // than the opcode and the mode combined
         debug_assert!(
