@@ -203,6 +203,8 @@ pub mod download {
     ///
     /// See [`AwaitingData::process`] for details.
     #[derive(Debug)]
+    #[derive(Clone, Copy)]
+    #[derive(PartialEq, Eq)]
     pub enum BlockReceived<'rx> {
         /// Indicates that a block of data has been received,
         /// but more are expected still.
@@ -218,17 +220,30 @@ pub mod download {
 
     #[cfg(test)]
     mod tests {
+        use macro_rules_attribute::apply;
+
+        use crate::array_slice;
+        use crate::concat_arrays;
+        use crate::infer_array_size;
+
         use super::*;
+
+        const LOREM: &str = include_str!("lorem.txt");
+        #[apply(infer_array_size)]
+        const LOREM_BYTES: [u8; _] = *include_bytes!("lorem.txt");
+        const TX: [u8; PACKET_SIZE] = [0; PACKET_SIZE];
 
         #[test]
         fn test_new_octet() {
             let filename = c"foo_bar.txt";
-            let mut buf = [0u8; PACKET_SIZE];
+            let mut tx = TX;
 
-            let result = download::new(&mut buf, filename, Mode::Octect).unwrap();
-            assert!(matches!(result, (AwaitingData { block_no: 1 }, _)));
+            let (result, tx_len) =
+                download::new(&mut tx, filename, Mode::Octect).unwrap();
+            assert_eq!(result, AwaitingData { block_no: 1 });
 
-            let (opcode, rest) = buf[..result.1].split_at(size_of::<u16>());
+            let tx = &tx[..tx_len];
+            let (opcode, rest) = tx.split_at(2);
             assert_eq!(opcode, 1u16.to_be_bytes());
             let (filename_bytes, mode) =
                 rest.split_at(rest.iter().position(|char| *char == b'\0').unwrap() + 1);
@@ -237,14 +252,16 @@ pub mod download {
         }
 
         #[test]
-        fn test_new_netscii() {
+        fn test_new_netascii() {
             let filename = c"foo_bar.txt";
-            let mut buf = [0u8; PACKET_SIZE];
+            let mut tx = TX;
 
-            let result = download::new(&mut buf, filename, Mode::Netascii).unwrap();
-            assert!(matches!(result, (AwaitingData { block_no: 1 }, _)));
+            let (result, tx_len) =
+                download::new(&mut tx, filename, Mode::Netascii).unwrap();
+            assert_eq!(result, AwaitingData { block_no: 1 });
 
-            let (opcode, rest) = buf[..result.1].split_at(size_of::<u16>());
+            let tx = &tx[..tx_len];
+            let (opcode, rest) = tx.split_at(2);
             assert_eq!(opcode, 1u16.to_be_bytes());
             let (filename_bytes, mode) =
                 rest.split_at(rest.iter().position(|char| *char == b'\0').unwrap() + 1);
@@ -254,15 +271,12 @@ pub mod download {
 
         #[test]
         fn test_new_long_filename() {
-            let filename = &const {
-                let mut filename = [b'a'; PACKET_SIZE];
-                filename[PACKET_SIZE - 1] = b'\0';
-                filename
-            };
+            let filename = &concat_arrays!([0; u8] => [b'a'; PACKET_SIZE - 1], [b'\0']);
+
             let filename = CStr::from_bytes_with_nul(filename).unwrap();
 
-            let mut buf = [0u8; PACKET_SIZE];
-            let result = download::new(&mut buf, filename, Mode::Octect);
+            let mut tx = [0u8; PACKET_SIZE];
+            let result = download::new(&mut tx, filename, Mode::Octect);
             assert!(matches!(
                 result,
                 Err(FilenameError {
@@ -270,6 +284,141 @@ pub mod download {
                     ..
                 })
             ))
+        }
+
+        #[test]
+        fn test_process_intermediate() {
+            let mut tx = TX;
+            const AWAITING: AwaitingData = AwaitingData { block_no: 1234 };
+
+            let packet = concat_arrays!([0; u8] =>
+                u16::to_be_bytes(3), u16::to_be_bytes(1234),
+                array_slice!(LOREM_BYTES; 0, BLOCK_SIZE)
+            );
+
+            let (result, tx_len) = AWAITING.process(&packet, &mut tx);
+
+            assert_eq!(
+                result,
+                Ok(BlockReceived::Intermediate(
+                    AwaitingData { block_no: 1235 },
+                    &array_slice!(LOREM_BYTES; 0, BLOCK_SIZE)
+                ))
+            );
+
+            let tx_len = tx_len.unwrap();
+            let ack =
+                concat_arrays!([0; u8] => u16::to_be_bytes(4), u16::to_be_bytes(1234));
+            assert_eq!(&tx[..tx_len], ack);
+        }
+
+        #[test]
+        fn test_process_final() {
+            let mut tx = TX;
+            const AWAITING: AwaitingData = AwaitingData { block_no: 1234 };
+
+            let packet = concat_arrays!([0; u8] =>
+                u16::to_be_bytes(3), u16::to_be_bytes(1234),
+                array_slice!(LOREM_BYTES; 0, BLOCK_SIZE - 1)
+            );
+
+            let (result, tx_len) = AWAITING.process(&packet, &mut tx);
+
+            assert_eq!(
+                result,
+                Ok(BlockReceived::Final(&LOREM_BYTES[..BLOCK_SIZE - 1]))
+            );
+
+            let tx_len = tx_len.unwrap();
+            let ack =
+                concat_arrays!([0; u8] => u16::to_be_bytes(4), u16::to_be_bytes(1234));
+            assert_eq!(&tx[..tx_len], ack);
+        }
+
+        #[test]
+        fn test_process_retransmission() {
+            macro_rules! packet_with_block_no {
+                ($block_no:expr) => {
+                    concat_arrays!([0; u8] =>
+                        u16::to_be_bytes(3), u16::to_be_bytes($block_no),
+                        array_slice!(LOREM_BYTES; 0, BLOCK_SIZE - 1), [0]
+                    )
+                }
+            }
+
+            let mut tx = TX;
+            const AWAITING: AwaitingData = AwaitingData { block_no: 1234 };
+
+            assert!(matches!(
+                AWAITING.process(&packet_with_block_no!(0u16), &mut tx),
+                (Ok(BlockReceived::Retransmission(AWAITING)), None)
+            ));
+            assert!(matches!(
+                AWAITING.process(&packet_with_block_no!(2345u16), &mut tx),
+                (Ok(BlockReceived::Retransmission(AWAITING)), None)
+            ));
+            assert!(matches!(
+                AWAITING.process(&packet_with_block_no!(56789u16), &mut tx),
+                (Ok(BlockReceived::Retransmission(AWAITING)), None)
+            ));
+        }
+
+        #[test]
+        fn test_process_bad_opcode() {
+            macro_rules! packet {
+                ($opcode: expr, $block_no:expr) => {
+                    concat_arrays!([0; u8] =>
+                        u16::to_be_bytes($opcode), u16::to_be_bytes($block_no),
+                        array_slice!(LOREM_BYTES; 0, BLOCK_SIZE - 1), [0]
+                    )
+                }
+            }
+
+            macro_rules! with_opcode {
+                ($opcode: expr, $awaiting: expr, $tx: expr) => {{
+                    const OPCODE: u16 = $opcode;
+                    let packet = &packet!(OPCODE, 1234);
+                    let (result, tx_len) = $awaiting.process(packet, $tx);
+                    assert_eq!(result, Err(TransferError::BadPacket));
+                    if let Some(tx_len) = tx_len {
+                        assert_is_err(&$tx[..tx_len], Some(4), None);
+                    }
+                }};
+            }
+
+            let mut tx = TX;
+            let awaiting = AwaitingData { block_no: 1234 };
+
+            with_opcode!(0, awaiting, &mut tx);
+            with_opcode!(1, awaiting, &mut tx);
+            with_opcode!(2, awaiting, &mut tx);
+            with_opcode!(4, awaiting, &mut tx);
+            with_opcode!(5, awaiting, &mut tx);
+            with_opcode!(6, awaiting, &mut tx);
+            with_opcode!(12345, awaiting, &mut tx);
+            with_opcode!(56789, awaiting, &mut tx);
+        }
+
+        fn assert_is_err(packet: &[u8], code: Option<u16>, message: Option<&CStr>) {
+            let opcode = &packet[0..2];
+            let error_code = &packet[2..4];
+            let error_message = &packet[4..];
+
+            assert_eq!(opcode, &5u16.to_be_bytes());
+
+            if let Some(code) = code {
+                assert_eq!(error_code, &code.to_be_bytes());
+            }
+
+            if let Some(message) = message {
+                assert_eq!(error_message, message.to_bytes_with_nul());
+            } else {
+                assert_eq!(
+                    error_message.iter().copied().filter(|char| *char == 0).count(),
+                    1
+                );
+                assert_eq!(error_message.last().copied(), Some(0));
+            }
         }
     }
 }

@@ -16,6 +16,8 @@ use core::error::Error;
 use core::ffi::CStr;
 use core::fmt::{Debug, Display};
 
+use macro_rules_attribute::apply;
+
 type IntoIter<T> = <T as IntoIterator>::IntoIter;
 
 /// The (maximum) size of a TFTP packet.
@@ -28,49 +30,16 @@ const BLOCK_NO_SIZE: usize = size_of::<u16>();
 /// The size of a payload data block.
 pub const BLOCK_SIZE: usize = 512;
 
-macro_rules! concat_arrays {
-    ([$default:expr; $t:ty] $($a:expr),* $(,)?) => {
-        {
-            const TOTAL_LEN: usize = 0 $(+ $a.len())*;
-            let mut arr = [$default; TOTAL_LEN];
-            let mut i = 0;
-            while i < TOTAL_LEN {
-                let mut relative_i = i;
-                $(
-                    if relative_i < $a.len() {
-                        arr[i] = $a[relative_i];
-                        i += 1;
-                        continue;
-                    } else {
-                        relative_i -= $a.len();
-                    }
-                )*
-                let _ = relative_i;
-                panic!("index out of range!");
-            }
-            arr
-        }
-    };
-}
-
-macro_rules! infer_array_size {
-    ($(#[$attrs:meta])* $vis:vis $bind:ident $ident:ident: [$t:ty; _] = $val:expr $(;)?) => {
-        $(#[$attrs])*
-        $vis $bind $ident: [$t; $val.len()] = $val;
-    };
-}
-
-infer_array_size! {
-    /// The response to a packet with an unknown transfer ID.
-    ///
-    /// As with any error packet, sending this is pure courtesy.
-    pub const UNKNOWN_TID_PACKET: [u8; _] = concat_arrays! {
-        [0; u8]
+/// The response to a packet with an unknown transfer ID.
+///
+/// As with any error packet, sending this is pure courtesy.
+#[apply(infer_array_size)]
+pub const UNKNOWN_TID_PACKET: [u8; _] = concat_arrays! {
+    [0; u8] =>
         (Opcode::Error as u16).to_be_bytes(),
         (ErrorCode::UnknownTransferID as u16).to_be_bytes(),
         b"\0",
-    };
-}
+};
 
 #[cfg(test)]
 mod tests {
@@ -1097,3 +1066,54 @@ impl<I: Iterator> ExactSizeIterator for CountedLen<I> {
         self.remaining
     }
 }
+
+macro_rules! concat_arrays {
+    ([$default:expr; $t:ty] => $($a:expr),* $(,)?) => {
+        {
+            const TOTAL_LEN: usize = 0 $(+ $a.len())*;
+            let mut arr = [$default; TOTAL_LEN];
+            let mut i = 0;
+            while i < TOTAL_LEN {
+                let mut relative_i = i;
+                $(
+                    if relative_i < $a.len() {
+                        arr[i] = $a[relative_i];
+                        i += 1;
+                        continue;
+                    } else {
+                        relative_i -= $a.len();
+                    }
+                )*
+                let _ = relative_i;
+                panic!("index out of range!");
+            }
+            arr
+        }
+    };
+}
+
+macro_rules! infer_array_size {
+    ($(#[$attrs:meta])* $vis:vis $bind:ident $ident:ident: [$t:ty; _] = $val:expr $(;)?) => {
+        $(#[$attrs])*
+        $vis $bind $ident: [$t; $val.len()] = $val;
+    };
+}
+
+macro_rules! array_slice {
+    ($array:expr, $default:expr; $start:expr, $end:expr) => {{
+        const LEN: usize = $end - $start;
+        let mut array = [$default; LEN];
+        let mut i = 0;
+        while i < LEN {
+            array[i] = $array[$start + i];
+            i += 1;
+        }
+        array
+    }};
+    ($array:expr; $start:expr, $end:expr) => {{
+        $crate::array_slice!($array, $array[0]; $start, $end)
+    }};
+}
+pub(crate) use array_slice;
+pub(crate) use concat_arrays;
+pub(crate) use infer_array_size;
