@@ -595,6 +595,9 @@ pub mod upload {
         /// as this will advance the underlying iterator
         /// when data is taken out of it and written into the `tx` buffer.
         ///
+        /// `data` should be able to yield chunks of [`BLOCK_SIZE`] bytes
+        /// (except for the final chunk), otherwise the transfer will fail.
+        ///
         ///
         ///
         /// Returns the size of the response packet, if one should be sent,
