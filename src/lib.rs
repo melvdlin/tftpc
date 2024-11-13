@@ -1099,21 +1099,50 @@ macro_rules! infer_array_size {
     };
 }
 
-macro_rules! array_slice {
-    ($array:expr, $default:expr; $start:expr, $end:expr) => {{
-        const LEN: usize = $end - $start;
-        let mut array = [$default; LEN];
-        let mut i = 0;
-        while i < LEN {
-            array[i] = $array[$start + i];
-            i += 1;
-        }
-        array
-    }};
-    ($array:expr; $start:expr, $end:expr) => {{
-        $crate::array_slice!($array, $array[0]; $start, $end)
-    }};
-}
-pub(crate) use array_slice;
 pub(crate) use concat_arrays;
 pub(crate) use infer_array_size;
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+
+    macro_rules! array_slice {
+        ($array:expr, $default:expr; $start:expr, $end:expr) => {{
+            const LEN: usize = $end - $start;
+            let mut array = [$default; LEN];
+            let mut i = 0;
+            while i < LEN {
+                array[i] = $array[$start + i];
+                i += 1;
+            }
+            array
+        }};
+        ($array:expr; $start:expr, $end:expr) => {{
+            $crate::test_helpers::array_slice!($array, $array[0]; $start, $end)
+        }};
+    }
+    use core::ffi::CStr;
+
+    pub(crate) use array_slice;
+
+    pub fn assert_is_err(packet: &[u8], code: Option<u16>, message: Option<&CStr>) {
+        let opcode = &packet[0..2];
+        let error_code = &packet[2..4];
+        let error_message = &packet[4..];
+
+        assert_eq!(opcode, &5u16.to_be_bytes());
+
+        if let Some(code) = code {
+            assert_eq!(error_code, &code.to_be_bytes());
+        }
+
+        if let Some(message) = message {
+            assert_eq!(error_message, message.to_bytes_with_nul());
+        } else {
+            assert_eq!(
+                error_message.iter().copied().filter(|char| *char == 0).count(),
+                1
+            );
+            assert_eq!(error_message.last().copied(), Some(0));
+        }
+    }
+}
