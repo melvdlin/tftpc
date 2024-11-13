@@ -1038,7 +1038,7 @@ impl<'a> Display for TransferError<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "download failed: {}",
+            "transfer failed: {}",
             match self {
                 | TransferError::BadPacket => "malformed packet",
                 | TransferError::Peer(_) => "peer terminated connection",
