@@ -162,11 +162,17 @@ pub mod download {
             let Data { data, block_no } = match packet {
                 | Packet::Data(data) => data,
                 | Packet::Error(error) => return peer_terminated(error),
-                | _ => return illegal_op(c"illegal operation", tx),
+                | _ => {
+                    return bad_packet(
+                        ErrorCode::IllegalOperation,
+                        c"illegal operation",
+                        tx,
+                    )
+                }
             };
 
             if data.len() > BLOCK_SIZE {
-                return illegal_op(c"block too large", tx);
+                return bad_packet(ErrorCode::Undefined, c"block too large", tx);
             }
 
             if block_no != self.block_no {
@@ -383,45 +389,27 @@ pub mod download {
                     let packet = &packet!(OPCODE, 1234);
                     let (result, tx_len) = $awaiting.process(packet, $tx);
                     assert_eq!(result, Err(TransferError::BadPacket));
-                    if let Some(tx_len) = tx_len {
-                        assert_is_err(&$tx[..tx_len], Some(4), None);
-                    }
+                    tx_len
+                        .inspect(|tx_len| assert_is_err(&$tx[..*tx_len], Some(4), None));
                 }};
             }
 
             let mut tx = TX;
-            let awaiting = AwaitingData { block_no: 1234 };
+            const AWAITING: AwaitingData = AwaitingData { block_no: 1234 };
 
-            with_opcode!(0, awaiting, &mut tx);
-            with_opcode!(1, awaiting, &mut tx);
-            with_opcode!(2, awaiting, &mut tx);
-            with_opcode!(4, awaiting, &mut tx);
-            with_opcode!(5, awaiting, &mut tx);
-            with_opcode!(6, awaiting, &mut tx);
-            with_opcode!(12345, awaiting, &mut tx);
-            with_opcode!(56789, awaiting, &mut tx);
-        }
+            with_opcode!(0, AWAITING, &mut tx);
+            with_opcode!(1, AWAITING, &mut tx);
+            with_opcode!(2, AWAITING, &mut tx);
+            with_opcode!(4, AWAITING, &mut tx);
+            with_opcode!(5, AWAITING, &mut tx);
+            with_opcode!(6, AWAITING, &mut tx);
+            with_opcode!(12345, AWAITING, &mut tx);
+            with_opcode!(56789, AWAITING, &mut tx);
 
-        fn assert_is_err(packet: &[u8], code: Option<u16>, message: Option<&CStr>) {
-            let opcode = &packet[0..2];
-            let error_code = &packet[2..4];
-            let error_message = &packet[4..];
-
-            assert_eq!(opcode, &5u16.to_be_bytes());
-
-            if let Some(code) = code {
-                assert_eq!(error_code, &code.to_be_bytes());
-            }
-
-            if let Some(message) = message {
-                assert_eq!(error_message, message.to_bytes_with_nul());
-            } else {
-                assert_eq!(
-                    error_message.iter().copied().filter(|char| *char == 0).count(),
-                    1
-                );
-                assert_eq!(error_message.last().copied(), Some(0));
-            }
+            let packet = &concat_arrays!([0; u8] => u16::to_be_bytes(4), u16::to_be_bytes(AWAITING.block_no));
+            let (result, tx_len) = AWAITING.process(packet, &mut tx);
+            assert_eq!(result, Err(TransferError::BadPacket));
+            tx_len.inspect(|tx_len| assert_is_err(&tx[..*tx_len], Some(4), None));
         }
 
         #[test]
@@ -435,7 +423,19 @@ pub mod download {
 
             let (result, tx_len) = awaiting.process(packet, &mut tx);
             assert_eq!(result, Err(TransferError::BadPacket));
-            assert_eq!(tx_len, None);
+            tx_len.inspect(|tx_len| assert_is_err(&tx[..*tx_len], Some(0), None));
+        }
+
+        #[test]
+        fn test_process_block_too_long() {
+            let mut tx = TX;
+            let awaiting = AwaitingData { block_no: 1234 };
+
+            let packet = &concat_arrays!([0; u8] => u16::to_be_bytes(3), u16::to_be_bytes(1234), LOREM_BYTES);
+
+            let (result, tx_len) = awaiting.process(packet, &mut tx);
+            assert_eq!(result, Err(TransferError::BadPacket));
+            tx_len.inspect(|tx_len| assert_is_err(&tx[..*tx_len], Some(0), None));
         }
 
         #[test]
@@ -492,12 +492,7 @@ pub mod download {
             let (result, tx_len) = awaiting.process(packet, &mut tx);
 
             assert_eq!(result, Err(TransferError::BadPacket));
-            if let Some(tx_len) = tx_len {
-                assert_is_err(&tx[..tx_len], Some(0), None);
-            }
-            if let Some(tx_len) = tx_len {
-                assert_is_err(&packet[..tx_len], Some(0), None);
-            }
+            tx_len.inspect(|tx_len| assert_is_err(&tx[..*tx_len], Some(0), None));
         }
     }
 }
@@ -639,7 +634,13 @@ pub mod upload {
             let Ack { block_no } = match packet {
                 | Packet::Ack(ack) => ack,
                 | Packet::Error(error) => return peer_terminated(error),
-                | _ => return illegal_op(c"illegal operation", tx),
+                | _ => {
+                    return bad_packet(
+                        ErrorCode::IllegalOperation,
+                        c"illegal operation",
+                        tx,
+                    )
+                }
             };
 
             if block_no != self.block_no {
@@ -880,23 +881,27 @@ pub mod upload {
                     let (result, tx_len) =
                         $awaiting.process(packet, $tx, core::iter::empty());
                     assert_eq!(result, Err(TransferError::BadPacket));
-                    if let Some(tx_len) = tx_len {
-                        assert_is_err(&$tx[..tx_len], Some(4), None);
-                    }
+                    tx_len
+                        .inspect(|tx_len| assert_is_err(&$tx[..*tx_len], Some(4), None));
                 }};
             }
 
             let mut tx = TX;
-            let awaiting = AwaitingAck { block_no: 1234 };
+            const AWAITING: AwaitingAck = AwaitingAck { block_no: 1234 };
 
-            with_opcode!(0, awaiting, &mut tx);
-            with_opcode!(1, awaiting, &mut tx);
-            with_opcode!(2, awaiting, &mut tx);
-            with_opcode!(3, awaiting, &mut tx);
-            with_opcode!(5, awaiting, &mut tx);
-            with_opcode!(6, awaiting, &mut tx);
-            with_opcode!(12345, awaiting, &mut tx);
-            with_opcode!(56789, awaiting, &mut tx);
+            with_opcode!(0, AWAITING, &mut tx);
+            with_opcode!(1, AWAITING, &mut tx);
+            with_opcode!(2, AWAITING, &mut tx);
+            with_opcode!(3, AWAITING, &mut tx);
+            with_opcode!(5, AWAITING, &mut tx);
+            with_opcode!(6, AWAITING, &mut tx);
+            with_opcode!(12345, AWAITING, &mut tx);
+            with_opcode!(56789, AWAITING, &mut tx);
+
+            let packet = &concat_arrays!([0; u8] => u16::to_be_bytes(3), u16::to_be_bytes(AWAITING.block_no), array_slice!(LOREM_BYTES; 0, BLOCK_SIZE));
+            let (result, tx_len) = AWAITING.process(packet, &mut tx, core::iter::empty());
+            assert_eq!(result, Err(TransferError::BadPacket));
+            tx_len.inspect(|tx_len| assert_is_err(&tx[..*tx_len], Some(4), None));
         }
 
         #[test]
@@ -968,29 +973,22 @@ pub mod upload {
             let (result, tx_len) = awaiting.process(packet, &mut tx, core::iter::empty());
 
             assert_eq!(result, Err(TransferError::BadPacket));
-            if let Some(tx_len) = tx_len {
-                assert_is_err(&tx[..tx_len], Some(0), None);
-            }
-            if let Some(tx_len) = tx_len {
-                assert_is_err(&packet[..tx_len], Some(0), None);
-            }
+            tx_len.inspect(|tx_len| assert_is_err(&tx[..*tx_len], Some(0), None));
         }
     }
 }
 
-fn illegal_op<'message, T>(
+fn bad_packet<'message, T>(
+    code: ErrorCode,
     message: &'message CStr,
     tx: &mut [u8; PACKET_SIZE],
 ) -> (Result<T, TransferError<'message>>, Option<usize>) {
     (
         Err(TransferError::BadPacket),
         Some(must_write(
-            Packet::Error(ProtocolError {
-                code: ErrorCode::IllegalOperation,
-                message,
-            })
-            .bytes()
-            .expect("message too long"),
+            Packet::Error(ProtocolError { code, message })
+                .bytes()
+                .expect("message too long"),
             tx,
             "error",
         )),

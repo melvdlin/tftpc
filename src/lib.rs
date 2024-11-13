@@ -1129,20 +1129,29 @@ pub(crate) mod test_helpers {
         let error_code = &packet[2..4];
         let error_message = &packet[4..];
 
-        assert_eq!(opcode, &5u16.to_be_bytes());
+        assert_eq!(opcode, &5u16.to_be_bytes(), "bad opcode");
 
         if let Some(code) = code {
-            assert_eq!(error_code, &code.to_be_bytes());
+            assert_eq!(error_code, &code.to_be_bytes(), "bad error code");
         }
 
         if let Some(message) = message {
-            assert_eq!(error_message, message.to_bytes_with_nul());
+            assert_eq!(
+                error_message,
+                message.to_bytes_with_nul(),
+                "bad error message"
+            );
         } else {
             assert_eq!(
                 error_message.iter().copied().filter(|char| *char == 0).count(),
-                1
+                1,
+                "error message does not contain exactly one nul-terminator"
             );
-            assert_eq!(error_message.last().copied(), Some(0));
+            assert_eq!(
+                error_message.last().copied(),
+                Some(0),
+                "trailing bytes after error message"
+            );
         }
     }
 }
