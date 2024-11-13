@@ -161,7 +161,9 @@ pub mod download {
 
             let Data { data, block_no } = match packet {
                 | Packet::Data(data) => data,
-                | Packet::Error(error) => return peer_terminated(error),
+                | Packet::Error(error) => {
+                    return (Err(TransferError::Peer(error.into())), None)
+                }
                 | _ => {
                     return bad_packet(
                         ErrorCode::IllegalOperation,
@@ -522,25 +524,27 @@ pub mod download {
 ///     let mut state;
 ///     let send;
 ///     (state, send) = upload::new(tx, filename, Mode::Octect)?;
+///     
+///     let mut data = file;
 ///
-///     let mut data = file.iter().copied();
 ///     loop {
 ///         sock.send(&tx[..send])?;
 ///         let received = sock.recv(rx)?;
 ///
-///         let (result, send) = state.process(&rx[..received], tx, data.by_ref());
+///         let (result, send) = state.process(&rx[..received], tx, data.iter().copied());
 ///
 ///         if let Some(send) = send {
 ///             sock.send(&tx[..send])?;
 ///         }
-///
-///         state = match result.map_err(TransferError::strip)? {
-///             | AckReceived::NextBlock(awaiting_ack) => awaiting_ack,
+///         let consumed;
+///         (state, consumed) = match result.map_err(TransferError::strip)? {
+///             | AckReceived::NextBlock(awaiting_ack, consumed) => (awaiting_ack, consumed),
 ///             | AckReceived::TransferComplete => break,
 ///             | AckReceived::Retransmission(awaiting_ack) => {
-///                 awaiting_ack
+///                 (awaiting_ack, 0)
 ///             }
-///         }
+///         };
+///         data = &data[consumed..];
 ///     }
 ///
 ///     Ok(())
@@ -591,17 +595,14 @@ pub mod upload {
         /// and potentially write an appropriate response into the provided `tx` buffer.
         ///
         /// Takes a `data` iterator of the remaining data to be uploaded.
-        /// This iterator should usually be passed by `&mut`,
-        /// as this will advance the underlying iterator
-        /// when data is taken out of it and written into the `tx` buffer.
         ///
         /// `data` should be able to yield chunks of [`BLOCK_SIZE`] bytes
         /// (except for the final chunk), otherwise the transfer will fail.
         ///
         ///
         ///
-        /// Returns the size of the response packet, if one should be sent,
-        /// and the status of the transfer.
+        /// Returns the status of the transfer
+        /// and the size of the response packet, if one should be sent.
         ///
         ///
         /// A [`TransferError`] indicates that the upload failed, and why.
@@ -610,9 +611,10 @@ pub mod upload {
         /// An [`AckReceived`] indicates that the download is either still in progress,
         /// or successfully finished:
         ///
-        /// - [`Intermediate`](AckReceived::NextBlock)
+        /// - [`NextBlock`](AckReceived::NextBlock)
         ///   indicates that the last sent packet has been acknowledged,
         ///   and the next data packet should be sent.
+        ///   Also undicates the number of bytes consumed from `data`.
         ///
         /// - [`TransferComplete`](AckReceived::TransferComplete)
         ///   indicates that the last sent packet has been acknowledged,
@@ -636,13 +638,15 @@ pub mod upload {
 
             let Ack { block_no } = match packet {
                 | Packet::Ack(ack) => ack,
-                | Packet::Error(error) => return peer_terminated(error),
+                | Packet::Error(error) => {
+                    return peer_terminated(error);
+                }
                 | _ => {
                     return bad_packet(
                         ErrorCode::IllegalOperation,
                         c"illegal operation",
                         tx,
-                    )
+                    );
                 }
             };
 
@@ -655,6 +659,7 @@ pub mod upload {
             if data.len() == 0 {
                 return (Ok(AckReceived::TransferComplete), None);
             }
+            let consumed = data.len();
 
             let mut tx = tx.iter_mut();
 
@@ -666,7 +671,7 @@ pub mod upload {
                     + must_write(data, tx.by_ref(), "data block");
 
             (
-                Ok(AckReceived::NextBlock(AwaitingAck { block_no })),
+                Ok(AckReceived::NextBlock(AwaitingAck { block_no }, consumed)),
                 Some(written),
             )
         }
@@ -689,7 +694,7 @@ pub mod upload {
     #[derive(Eq, PartialEq)]
     #[derive(Hash)]
     pub enum AckReceived {
-        NextBlock(AwaitingAck),
+        NextBlock(AwaitingAck, usize),
         TransferComplete,
         Retransmission(AwaitingAck),
     }
@@ -774,9 +779,12 @@ pub mod upload {
 
             assert_eq!(
                 result,
-                Ok(AckReceived::NextBlock(AwaitingAck {
-                    block_no: AWAITING.block_no.wrapping_add(1)
-                }))
+                Ok(AckReceived::NextBlock(
+                    AwaitingAck {
+                        block_no: AWAITING.block_no.wrapping_add(1)
+                    },
+                    BLOCK_SIZE
+                ))
             );
             assert!(data.eq(LOREM_BYTES[BLOCK_SIZE..].iter().copied()));
 
@@ -799,9 +807,12 @@ pub mod upload {
 
             assert_eq!(
                 result,
-                Ok(AckReceived::NextBlock(AwaitingAck {
-                    block_no: AWAITING.block_no.wrapping_add(1)
-                }))
+                Ok(AckReceived::NextBlock(
+                    AwaitingAck {
+                        block_no: AWAITING.block_no.wrapping_add(1)
+                    },
+                    BLOCK_SIZE - 1
+                ))
             );
             assert!(data.eq(core::iter::empty()));
 
